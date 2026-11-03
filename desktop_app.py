@@ -193,6 +193,8 @@ class Page:
     def close(self):
         self.alive = False
         self.cancel_capture()
+        if hasattr(self, "stop"):
+            self.stop.set()  # a closed page's global search stops early
         # Let any pending draw finish before removing its Tk widget. No private
         # Matplotlib manager/canvas attributes are accessed.
         self.canvas.flush_events()
@@ -459,12 +461,17 @@ class VectorPage(Page):
 RESULT_ADVICE = {
     "ok": "Check visually that the blue points lie on the black walls. Day 1 poses are estimates; "
           "this is a matching result, not measured accuracy.",
-    "low_score": "Not localised. Move the guess (left click) and make the arrow point where the LiDAR "
-                 "front faced (right click): the search only covers ±1 m and ±30°.",
-    "at_search_limit": "Not confirmed: the best pose is on the search edge. Press 'Use result as next "
-                       "guess', then Auto Align again.",
-    "ambiguous": "Not reliable: a clearly different pose matches almost as well. Refine the guess and retry.",
-    "out_of_map": "Not localised: most points fall outside the map. Is the guess inside the mapped room?",
+    "low_score": "Not localised: the scan does not fit the map well enough anywhere searched. Global: "
+                 "is the LiDAR inside the mapped room with a clear view (nearby objects can hide the "
+                 "walls)? Local: move the guess and point its arrow where the LiDAR front faced.",
+    "at_search_limit": "Not confirmed: the best pose is on the local search edge. Press 'Use result as "
+                       "next guess' and Localise again, or use the global search.",
+    "ambiguous": "Not reliable: a clearly different pose (purple) matches almost as well, e.g. a "
+                 "symmetric part of the room. Capture from a spot that sees distinctive features.",
+    "out_of_map": "Not localised: most points fall outside the map at the best pose.",
+    "cancelled": "Search cancelled.",
+    "weak": "Plausible but not confirmed: check that the faded points lie on the walls, or capture "
+            "again from a spot with more distinctive features. Do not treat it as a position fix.",
     "insufficient_points": "Capture again: too few usable points.",
     "insufficient_coverage": "Capture again with an unobstructed view: the scan covers too narrow an angle.",
 }
@@ -472,12 +479,22 @@ RESULT_ADVICE = {
 
 class LocalisationPage(Page):
     MODES = ("Localise New Scan", "Evaluate Recorded Scans")
+    SEARCHES = ("Global: whole map, 360°", "Local: ±1 m / ±30° around a guess")
+    SEARCH_NOTES = (
+        "No initial pose needed: every plausible position near the mapped room and "
+        "every heading is searched on the occupancy grid. Several seconds; ambiguity "
+        "is reported.",
+        "Faster (under 1 s). Needs a guess within ±1 m and ±30°: left-click the "
+        "position, right-click toward the LiDAR front (+X).")
 
     def __init__(self, app):
         super().__init__(app)
         self.viewer = None
         self.generation = 0
         self.targets = []
+        self.stop = threading.Event()
+        self.progress = None
+        self.shown_progress = None
         section(self.controls, "Grid Localisation")
         self.mode = ttk.Combobox(self.controls, state="readonly", values=self.MODES)
         self.mode.set(self.MODES[0])
@@ -502,11 +519,22 @@ class LocalisationPage(Page):
         button(self.eval_controls, "New perturbed guess", self.new_guess)
         button(self.eval_controls, "Evaluate all / export CSV + JSON", self.evaluate)
         note(self.eval_controls, "Agreement with Day 1 estimates is not physical ground-truth accuracy.")
-        section(self.controls, "Initial pose")
-        self.pose = PoseInputs(self.controls, self.get_pose, self.set_pose)
-        note(self.controls, "Left click on map: position\nRight click: point heading toward cursor\nSearch: ±1 m and ±30° around this guess.")
-        self.align_button = button(self.controls, "Auto Align", self.align)
-        button(self.controls, "Use result as next guess", self.use_result)
+        section(self.controls, "Search")
+        self.search = ttk.Combobox(self.controls, state="readonly", values=self.SEARCHES)
+        self.search.set(self.SEARCHES[0])
+        self.search.pack(fill="x", pady=4)
+        self.search.bind("<<ComboboxSelected>>", self.change_search)
+        self.search_note = note(self.controls, self.SEARCH_NOTES[0])
+        row = ttk.Frame(self.controls)
+        row.pack(fill="x", pady=3)
+        self.align_button = ttk.Button(row, text="Localise", command=self.align)
+        self.align_button.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Cancel", command=self.cancel_search).pack(side="left", padx=(4, 0))
+        self.local_controls = ttk.Frame(self.controls)
+        section(self.local_controls, "Initial pose (local search)")
+        self.pose = PoseInputs(self.local_controls, self.get_pose, self.set_pose)
+        note(self.local_controls, "Left click on map: position\nRight click: point heading toward cursor")
+        button(self.local_controls, "Use result as next guess", self.use_result)
         self.result_label = note(self.controls, "Load a separate scan or capture one to begin.")
         self.set_info("Building fixed reference map…")
         app.derived(self, "grid", build_grid, self.ready)
@@ -521,6 +549,11 @@ class LocalisationPage(Page):
         self.verdict = self.viewer.axes.text(
             0.01, 0.99, "", transform=self.viewer.axes.transAxes, va="top", fontsize=10,
             weight="bold", zorder=10, bbox=dict(facecolor="white", alpha=0.85, edgecolor="none"))
+        # The best clearly different pose, drawn only when it makes the answer ambiguous.
+        self.runner_points = self.viewer.axes.scatter(np.empty(0), np.empty(0), s=5,
+                                                      color="tab:purple", alpha=0.6, zorder=3)
+        self.runner_marker = loc.pose_marker(self.viewer.axes, "tab:purple", "--")
+        self.change_search()
         self.set_info("Reference ready. Load a separate scan or capture a fresh one.")
         self.sync()
 
@@ -531,13 +564,23 @@ class LocalisationPage(Page):
         self.viewer.aligned_points.set_alpha(1.0 if reliable else 0.3)
         for artist in self.viewer.aligned_marker:
             artist.set_alpha(1.0 if reliable else 0.3)
+        runner = result.details.get("runner_up_pose") if result is not None else None
+        if result is not None and result.status == "ambiguous" and runner is not None:
+            pose = common.pose_from_day1(runner)
+            self.runner_points.set_offsets(loc.transform_points(self.viewer.points, pose))
+            loc.set_pose_marker(self.runner_marker, pose)
+        else:
+            self.runner_points.set_offsets(np.empty((0, 2)))
+            loc.set_pose_marker(self.runner_marker, None)
         if result is None:
             self.verdict.set_text("")
         elif reliable:
             self.verdict.set_text("Localised (status ok)")
             self.verdict.set_color("#1B7F4B")
         else:
-            self.verdict.set_text(f"NOT localised ({result.status}): faded pose is not an answer")
+            self.verdict.set_text(f"NOT localised ({result.status}): faded pose is not an answer"
+                                  + ("; purple = equally good alternative"
+                                     if result.status == "ambiguous" and runner else ""))
             self.verdict.set_color("#B3261E")
 
     def sync(self):
@@ -607,8 +650,8 @@ class LocalisationPage(Page):
         self.eval_controls.pack_forget()
         self.new_controls.pack(fill="x", after=self.mode)
         self.set_info(f"{name}\n{len(points)} original local points. Source pose ignored.\n"
-                      "Next: left-click where the LiDAR stood, right-click toward its front (+X), "
-                      "then Auto Align. The answer must lie within ±1 m and ±30° of this guess.")
+                      "Next: press Localise. Global search needs no guess; local search "
+                      "needs one within ±1 m and ±30°.")
         self.sync()
         return True
 
@@ -658,18 +701,65 @@ class LocalisationPage(Page):
             return
         generation, initial = self.generation, viewer.initial_pose()
         grid, points, config = viewer.grid_map, viewer.points.copy(), viewer.config
+        if self.global_search():
+            self.stop = stop = threading.Event()
+            self.progress = 0.0
+
+            def report(fraction):
+                self.progress = fraction  # read by tick() on the Tk thread
+
+            def work():
+                return loc.localise_global(grid, points, progress=report, should_stop=stop.is_set)
+            label = "Localising: global search…"
+        else:
+            self.progress = None
+
+            def work():
+                return loc.localise_scan(grid, points, initial, config)
+            label = "Localising: local search…"
 
         def done(result):
-            if generation != self.generation or initial != viewer.initial_pose():
-                self.set_info("Pose or target changed during alignment. Press Auto Align again.")
+            self.progress = self.shown_progress = None
+            if result.status == "cancelled":
+                self.set_info("Search cancelled. Nothing was changed.")
+                return
+            if generation != self.generation or (
+                    result.initial_pose is not None and initial != viewer.initial_pose()):
+                self.set_info("Pose or target changed during the search. Press Localise again.")
                 return
             viewer.show_result(result)
             self.set_info(f"{result.status}: {result.reason}\n\n{RESULT_ADVICE.get(result.status, '')}")
             self.app.last_runtime = f"{result.runtime_ms:.0f} ms"
             self.sync()
 
-        self.run("Aligning on the occupancy grid…", lambda: loc.localise_scan(grid, points, initial, config), done,
-                 controls=(self.align_button,))
+        self.run(label, work, done, controls=(self.align_button,))
+
+    def global_search(self):
+        return self.search.current() == 0
+
+    def change_search(self, _=None):
+        """Global: no guess, so the guess overlay and pose inputs are hidden."""
+        index = 0 if self.global_search() else 1
+        self.search_note.configure(text=self.SEARCH_NOTES[index])
+        if index:
+            self.local_controls.pack(fill="x", after=self.search_note)
+        else:
+            self.local_controls.pack_forget()
+        if self.viewer is not None:
+            self.viewer.initial_points.set_visible(bool(index))
+            for artist in self.viewer.initial_marker:
+                artist.set_visible(bool(index))
+            self.canvas.draw_idle()
+
+    def cancel_search(self):
+        self.stop.set()
+
+    def tick(self):
+        if self.busy and self.progress is not None:
+            shown = int(self.progress * 20)  # 5 % steps: no label churn
+            if shown != self.shown_progress:
+                self.shown_progress = shown
+                self.set_info(f"Localising: global search… {shown * 5} %\nCancel stops it; nothing is changed.")
 
     def evaluate(self):
         if self.busy or self.viewer is None:

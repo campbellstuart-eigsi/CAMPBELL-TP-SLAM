@@ -380,6 +380,29 @@ def prepare_points(scan_points, config):
             voxel_downsample(points, config.coarse_voxel_m))
 
 
+def refine_candidate(points, fields, grid_map, levels, pose):
+    """Levels 1.. around one level-0 pose: (pose, final score, poses scored).
+
+    Each level searches +- one step of the previous level with its own
+    finer steps and narrower field; the score is the last level's field.
+    """
+    evaluated = 0
+    for previous, level, level_field in zip(levels, levels[1:], fields[1:]):
+        positions, headings = level_grid(
+            pose, previous.xy_step_m,
+            math.radians(previous.theta_step_deg), level)
+        scores = score_poses(points, level_field, grid_map, positions,
+                             headings)
+        evaluated += scores.size
+        h, p = np.unravel_index(np.argmax(scores), scores.shape)
+        pose = (float(positions[p, 0]), float(positions[p, 1]),
+                float(headings[h]))
+    final_score = float(score_poses(points, fields[-1], grid_map,
+                                    np.array([pose[:2]]),
+                                    np.array([pose[2]]))[0, 0])
+    return pose, final_score, evaluated
+
+
 def localise_scan(grid_map, scan_points, initial_pose, config=None,
                   true_pose=None):
     """Estimate the pose of one scan on an occupancy grid map.
@@ -440,21 +463,9 @@ def localise_scan(grid_map, scan_points, initial_pose, config=None,
     # Finer levels around each candidate.
     refined = []
     for coarse_pose, _ in candidates:
-        pose = coarse_pose
-        for previous, level, level_field in zip(levels, levels[1:],
-                                                fields[1:]):
-            positions, headings = level_grid(
-                pose, previous.xy_step_m,
-                math.radians(previous.theta_step_deg), level)
-            scores = score_poses(points, level_field, grid_map, positions,
-                                 headings)
-            evaluated += scores.size
-            h, p = np.unravel_index(np.argmax(scores), scores.shape)
-            pose = (float(positions[p, 0]), float(positions[p, 1]),
-                    float(headings[h]))
-        final_score = float(score_poses(points, fields[-1], grid_map,
-                                        np.array([pose[:2]]),
-                                        np.array([pose[2]]))[0, 0])
+        pose, final_score, count = refine_candidate(points, fields, grid_map,
+                                                    levels, coarse_pose)
+        evaluated += count
         refined.append((pose, final_score, coarse_pose))
     refined.sort(key=lambda item: -item[1])  # stable: ties keep coarse order
     pose, score, coarse_pose = refined[0]
@@ -503,6 +514,248 @@ def localise_scan(grid_map, scan_points, initial_pose, config=None,
                            "coarse_candidates": [
                                [round(v, 4) for v in pose_to_day1(c)] + [s]
                                for c, s in candidates]})
+
+
+# ---------------------------------------------------------------------------
+# 3b. GLOBAL localisation: no initial pose
+# ---------------------------------------------------------------------------
+# The same grid method, with level 0 covering the whole map instead of a
+# window: every heading (360 deg) and every plausible robot position. The
+# idea is the candidate generation of Code 01's correlative search (score
+# the whole area coarsely, keep several clearly different poses, refine
+# each), but the field is the Part 2 OCCUPANCY GRID's likelihood field, not
+# a point cloud, and the refinement is refine_candidate() above.
+#
+# Plausible positions: within GLOBAL position margin of a cell the map has
+# OBSERVED (free or occupied). Not "free cells only": a LiDAR placed on a
+# cabinet stands where floor-level scans never looked (real case: the
+# classroom corner at about (-4.5, 3.5) is an unobserved cell).
+#
+# Verdict, without any reference pose:
+#   - the same score thresholds as the local search (min_score, out_of_map);
+#   - AMBIGUOUS when a clearly different refined pose scores >= ambiguity
+#     ratio x best: the whole room was searched, so this is a real
+#     alternative, e.g. a symmetric room;
+#   - "ok" (confident) only with score >= confident_score AND runner-up
+#     <= confident_ratio x best; otherwise "weak": plausible, CHECK
+#     VISUALLY. Searching the whole room makes a wrong-but-plausible fit
+#     more likely than in a +-1 m window. Real-data calibration (stress
+#     test: MIRROR images of the 24 real scans, a room that does not exist):
+#     the local thresholds alone reported 10 mirrors "ok"; with this tier
+#     0 of 24 are "ok" (highest mirror score with a clear margin: 0.371),
+#     while 19 of 21 locatable real scans stay "ok" (2 become "weak");
+#   - support figures reported with every answer: inlier fraction (points
+#     within one cell of an occupied cell) and known fraction (points in
+#     cells the map has observed: reference-map coverage).
+@dataclass(frozen=True)
+class GlobalSearchConfig:
+    levels: tuple = (SearchLevel(0.20, 4.0, 0.20),
+                     SearchLevel(0.05, 1.0, 0.10),
+                     SearchLevel(0.01, 0.2, 0.07))
+    position_margin_m: float = 0.5  # positions near OBSERVED cells only
+    candidates: int = 10           # distinct level-0 poses refined further
+    heading_batch: int = 6         # headings per progress / cancel check
+    inlier_distance_m: float = 0.10
+    confident_score: float = 0.40   # "ok" needs at least this score ...
+    confident_ratio: float = 0.70   # ... and runner-up <= this x best
+    # Range filter, thinning, distinctness and verdict thresholds: shared
+    # with (and identical to) the local search.
+    checks: GridSearchConfig = GridSearchConfig()
+
+    def to_dict(self):
+        data = asdict(self)
+        data["levels"] = [asdict(level) for level in self.levels]
+        data["checks"] = self.checks.to_dict()
+        return data
+
+
+class SearchCancelled(Exception):
+    """Raised inside a global search when its should_stop() returns True."""
+
+
+def plausible_positions(grid_map, step_m, margin_m):
+    """(P, 2) lattice positions within margin_m of an observed map cell."""
+    observed = grid_map.state != UNKNOWN_STATE
+    radius = int(math.ceil(margin_m / grid_map.cell_size))
+    padded = np.pad(observed, radius, constant_values=False)
+    near = np.zeros_like(observed)
+    for dj in range(-radius, radius + 1):
+        for di in range(-radius, radius + 1):
+            if math.hypot(di, dj) * grid_map.cell_size <= margin_m:
+                near |= padded[radius + dj:radius + dj + grid_map.height,
+                               radius + di:radius + di + grid_map.width]
+    left, right, bottom, top = grid_map.extent
+    xs = np.arange(left + step_m / 2, right, step_m)
+    ys = np.arange(bottom + step_m / 2, top, step_m)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    positions = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+    i = np.floor((positions[:, 0] - grid_map.x_min) / grid_map.cell_size)
+    j = np.floor((positions[:, 1] - grid_map.y_min) / grid_map.cell_size)
+    return positions[near[j.astype(int), i.astype(int)]]
+
+
+def coarse_score_poses(points, field, grid_map, positions, headings):
+    """Level-0 scores[h, p] by NEAREST-CELL lookup: candidates only.
+
+    Same score as score_poses() but the field is read in the cell holding
+    each point instead of interpolated (14.5 s -> 2 s for a whole-room
+    search of a real 939-point scan). Positions lie on cell
+    borders (plausible_positions), so a point's cell is the position's cell
+    plus the point's own cell offset: integer additions only. The field is
+    padded with zeros beyond the grid (outside points count 0, as in
+    sample_field). Final scores always come from score_poses().
+    """
+    pad = int(math.ceil(np.max(np.hypot(points[:, 0], points[:, 1]))
+                        / grid_map.cell_size)) + 2
+    padded = np.pad(field, pad)
+    u, v = grid_map.cell_coordinates(positions)
+    position_i = np.rint(u + 0.5).astype(np.int64) + pad
+    position_j = np.rint(v + 0.5).astype(np.int64) + pad
+    scores = np.empty((len(headings), len(positions)))
+    for index, theta in enumerate(headings):
+        rotated = points @ rotation(theta).T
+        offset_i = np.floor(rotated[:, 0] / grid_map.cell_size).astype(np.int64)
+        offset_j = np.floor(rotated[:, 1] / grid_map.cell_size).astype(np.int64)
+        scores[index] = padded[position_j[:, None] + offset_j[None, :],
+                               position_i[:, None] + offset_i[None, :]
+                               ].mean(axis=1)
+    return scores
+
+
+def support_fractions(grid_map, points, pose, inlier_distance_m):
+    """(inlier fraction, known fraction) of a scan placed at `pose`."""
+    placed = transform_points(points, pose)
+    i = np.floor((placed[:, 0] - grid_map.x_min) / grid_map.cell_size)
+    j = np.floor((placed[:, 1] - grid_map.y_min) / grid_map.cell_size)
+    inside = (i >= 0) & (i < grid_map.width) & (j >= 0) & (j < grid_map.height)
+    i = i[inside].astype(int)
+    j = j[inside].astype(int)
+    distance = grid_map.distance_to_occupied(inlier_distance_m)
+    inlier = np.count_nonzero(distance[j, i] <= inlier_distance_m + 1e-9)
+    known = np.count_nonzero(grid_map.state[j, i] != UNKNOWN_STATE)
+    return inlier / len(points), known / len(points)
+
+
+def localise_global(grid_map, scan_points, config=None, true_pose=None,
+                    progress=None, should_stop=None):
+    """Estimate a scan's pose on the WHOLE grid map; no initial pose.
+
+    progress(fraction) and should_stop() are optional callbacks (a GUI's
+    progress bar and Cancel button); a cancelled search returns status
+    "cancelled". true_pose is only used after the search, as in
+    localise_scan(). Returns a LocalisationResult (initial_pose None).
+    """
+    config = config or GlobalSearchConfig()
+    checks, levels = config.checks, config.levels
+    start = time.perf_counter()
+    points, coarse_points = prepare_points(scan_points, checks)
+
+    def finish(status, reason, **values):
+        result = LocalisationResult(
+            method="grid_global", status=status, reason=reason,
+            initial_pose=None, points_used=len(points),
+            runtime_ms=(time.perf_counter() - start) * 1000.0, **values)
+        return result.evaluate_against(true_pose) if true_pose else result
+
+    if len(points) < checks.min_points:
+        return finish("insufficient_points",
+                      f"{len(points)} usable points after filtering and "
+                      f"thinning; at least {checks.min_points} needed")
+    coverage = angular_coverage_deg(points)
+    if coverage < checks.min_coverage_deg:
+        return finish("insufficient_coverage",
+                      f"the scan covers only {coverage:.0f} deg around the "
+                      f"sensor; at least {checks.min_coverage_deg:.0f} deg "
+                      f"needed to fix a pose")
+
+    fields = [grid_map.score_field(level.sigma_m, checks.free_penalty)
+              for level in levels]
+    positions = plausible_positions(grid_map, levels[0].xy_step_m,
+                                    config.position_margin_m)
+    step = math.radians(levels[0].theta_step_deg)
+    headings = -math.pi + step * np.arange(int(round(2 * math.pi / step)))
+    scores = np.empty((len(headings), len(positions)))
+    try:
+        for first in range(0, len(headings), config.heading_batch):
+            if should_stop is not None and should_stop():
+                raise SearchCancelled
+            batch = headings[first:first + config.heading_batch]
+            scores[first:first + len(batch)] = coarse_score_poses(
+                coarse_points, fields[0], grid_map, positions, batch)
+            if progress is not None:
+                progress(0.8 * (first + len(batch)) / len(headings))
+        evaluated = scores.size
+        candidates = best_distinct(scores, positions, headings,
+                                   config.candidates, checks)
+        refined = []
+        for number, (coarse_pose, _) in enumerate(candidates):
+            if should_stop is not None and should_stop():
+                raise SearchCancelled
+            pose, final_score, count = refine_candidate(
+                points, fields, grid_map, levels, coarse_pose)
+            evaluated += count
+            refined.append((pose, final_score, coarse_pose))
+            if progress is not None:
+                progress(0.8 + 0.2 * (number + 1) / len(candidates))
+    except SearchCancelled:
+        return finish("cancelled", "search cancelled by the user")
+
+    refined.sort(key=lambda item: -item[1])
+    pose, score, _ = refined[0]
+    pose = (pose[0], pose[1], wrap_angle(pose[2]))
+    runner = next(((other, other_score) for other, other_score, _
+                   in refined[1:] if poses_distinct(other, pose, checks)),
+                  (None, None))
+    outside = out_of_map_fraction(grid_map, points, pose)
+    inlier, known = support_fractions(grid_map, points, pose,
+                                      config.inlier_distance_m)
+    support = (f"; {inlier:.0%} of points within "
+               f"{config.inlier_distance_m * 100:.0f} cm of a mapped "
+               f"obstacle, {known:.0%} on observed cells")
+    if outside > checks.max_out_of_map:
+        status, reason = "out_of_map", (
+            f"{outside:.0%} of the points fall outside the grid at the best "
+            f"pose (at most {checks.max_out_of_map:.0%} allowed)")
+    elif score < checks.min_score:
+        status, reason = "low_score", (
+            f"best score {score:.3f} is below {checks.min_score}: the scan "
+            f"does not match the map anywhere in the room")
+    elif runner[1] is not None and \
+            runner[1] >= checks.ambiguity_ratio * score:
+        x, y, heading = pose_to_day1(runner[0])
+        status, reason = "ambiguous", (
+            f"a clearly different pose (X {x:.2f} m, Y {y:.2f} m, "
+            f"{heading:.0f} deg) scores {runner[1]:.3f}, almost as well as "
+            f"the best {score:.3f}")
+    elif score < config.confident_score or (
+            runner[1] is not None
+            and runner[1] > config.confident_ratio * score):
+        status, reason = "weak", (
+            f"plausible but NOT CONFIRMED (check visually): score "
+            f"{score:.3f}" + (f", best different pose {runner[1]:.3f}"
+                              if runner[1] is not None else "")
+            + f". Confident needs score >= {config.confident_score} and "
+              f"the best different pose <= {config.confident_ratio:.0%} "
+              f"of it")
+    else:
+        status, reason = "ok", (
+            f"score {score:.3f}"
+            + (f", best different pose {runner[1]:.3f}"
+               if runner[1] is not None else ""))
+    return finish(status, reason + support, pose=pose, score=score,
+                  candidates_evaluated=int(evaluated),
+                  out_of_map_fraction=outside, runner_up_score=runner[1],
+                  details={"coverage_deg": coverage,
+                           "coarse_points": len(coarse_points),
+                           "positions": len(positions),
+                           "headings": len(headings),
+                           "inlier_fraction": inlier,
+                           "known_fraction": known,
+                           "runner_up_pose": None if runner[0] is None
+                           else [round(v, 4) for v in pose_to_day1(runner[0])],
+                           "candidates": [
+                               [round(v, 4) for v in pose_to_day1(p)] + [s]
+                               for p, s, _ in refined]})
 
 
 # ---------------------------------------------------------------------------
@@ -1272,7 +1525,7 @@ class AutoAlignViewer:
         self.initial_points.set_offsets(transform_points(self.points,
                                                          initial))
         set_pose_marker(self.initial_marker, initial)
-        if self.result is not None and self.result.initial_pose != initial:
+        if self.result is not None and self.result.initial_pose is not None                 and self.result.initial_pose != initial:
             self.result = None  # the shown result was for another guess
             self.aligned_points.set_offsets(np.empty((0, 2)))
             set_pose_marker(self.aligned_marker, None)
@@ -1281,10 +1534,13 @@ class AutoAlignViewer:
 
     def update_info(self):
         import textwrap
+        global_result = self.result is not None and self.result.initial_pose is None
         if self.mode == "new":
             x, y, heading = pose_to_day1(self.initial_pose())
-            lines = [f"Initial: X {x:.3f} m, Y {y:.3f} m",
-                     f"Heading {heading:.2f} deg", ""]
+            lines = (["Global search: whole map, 360 deg", "(no initial pose used)", ""]
+                     if global_result else
+                     [f"Initial: X {x:.3f} m, Y {y:.3f} m",
+                      f"Heading {heading:.2f} deg", ""])
             if self.result is None:
                 lines += ["Load or capture a new scan." if self.external_scan is None
                           else "Press Auto Align.",
@@ -1301,6 +1557,9 @@ class AutoAlignViewer:
                           f"points: {result.points_used} after thinning"]
                 if result.runner_up_score is not None:
                     lines.append(f"runner-up: {result.runner_up_score:.3f}")
+                if "inlier_fraction" in result.details:
+                    lines.append(f"near mapped walls: {result.details['inlier_fraction']:.0%}, "
+                                 f"on observed cells: {result.details['known_fraction']:.0%}")
                 lines += textwrap.wrap(result.reason, 44)
             lines += ["", "Reference map stays fixed.",
                       "No measured pose: matching status", "does not establish physical accuracy."]
@@ -1323,7 +1582,8 @@ class AutoAlignViewer:
                       "Right click: turn the guess towards",
                       "the click."]
         else:
-            lines += [f"status : {result.status}"]
+            lines += [f"status : {result.status}"
+                      + ("  (global search: guess not used)" if global_result else "")]
             if result.pose is not None:
                 agreement = common.pose_error(result.pose, day1)
                 lines += [pose_line("aligned", result.pose),
@@ -1871,6 +2131,81 @@ class RealSessionTests(RealDataTestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         with self.assertRaises(part2.SessionError):
             load_session(path)
+
+
+class GlobalLocalisationTests(RealDataTestCase):
+    """Whole-map search, no initial pose, real LD06 recordings."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.full = build_grid_map(cls.scans, cls.spec)[0]
+
+    def test_leave_one_out_scans_found_without_initial_pose(self):
+        for scan in (self.scans[1], self.scans[9]):
+            grid = reference_map(self.scans, scan["id"], self.spec)[0]
+            result = localise_global(grid, scan["points_local"],
+                                     true_pose=scan["pose_rad"])
+            with self.subTest(scan=scan["id"]):
+                self.assertEqual(result.status, "ok", result.reason)
+                self.assertIsNone(result.initial_pose)
+                # Agreement with the Day 1 ESTIMATE (not ground truth).
+                self.assertLess(result.position_error_m, 0.05)
+                self.assertLess(result.angle_error_deg, 0.5)
+
+    def test_occluded_and_mirrored_scans_are_not_ok(self):
+        separate = common.SCANS_DIR / "classroom_session.json"
+        if not separate.exists():
+            self.skipTest("classroom_session.json absent")
+        occluded = part2.load_session_scans(separate)[0]["points_local"]
+        self.assertEqual(localise_global(self.full, occluded).status,
+                         "low_score")
+        # SYNTHETIC stress test: a mirror image is a room that does not
+        # exist (it is never used as a measurement).
+        for scan in (self.scans[0], self.scans[6]):
+            mirrored = scan["points_local"] * np.array([1.0, -1.0])
+            grid = reference_map(self.scans, scan["id"], self.spec)[0]
+            self.assertNotEqual(localise_global(grid, mirrored).status, "ok")
+
+    def test_cancel_and_progress(self):
+        calls = []
+        result = localise_global(self.full, self.scans[0]["points_local"],
+                                 progress=calls.append,
+                                 should_stop=lambda: len(calls) >= 2)
+        self.assertEqual(result.status, "cancelled")
+        self.assertIsNone(result.pose)
+        self.assertTrue(all(0 <= value <= 1 for value in calls))
+
+    def test_coarse_lookup_is_nearest_cell_sampling(self):
+        positions = plausible_positions(self.full, 0.2, 0.5)[::7]
+        points = voxel_downsample(self.scans[0]["points_local"], 0.1)
+        field = self.full.score_field(0.2, 0.5)
+        headings = np.radians([0.0, 37.0, -93.0])
+        fast = coarse_score_poses(points, field, self.full, positions,
+                                  headings)
+        for index, theta in enumerate(headings):
+            placed = positions[:, None, :] + (points @ rotation(theta).T)
+            u, v = self.full.cell_coordinates(placed)
+            i, j = np.floor(u + 0.5).astype(int), np.floor(v + 0.5).astype(int)
+            inside = ((i >= 0) & (i < self.full.width) & (j >= 0)
+                      & (j < self.full.height))
+            direct = np.where(inside, field[j.clip(0, self.full.height - 1),
+                                            i.clip(0, self.full.width - 1)],
+                              0.0).mean(axis=1)
+            # Equal except points exactly on a cell border (rounding).
+            np.testing.assert_allclose(fast[index], direct, atol=0.01)
+
+    def test_positions_include_unobserved_spot_next_to_the_map(self):
+        # A LiDAR on a cabinet (real classroom corner about (-4.48, 3.53))
+        # stands on a cell the floor-level scans never observed.
+        positions = plausible_positions(self.full, 0.2, 0.5)
+        self.assertLess(np.min(np.hypot(positions[:, 0] + 4.48,
+                                        positions[:, 1] - 3.53)), 0.15)
+        left, right, bottom, top = self.full.extent
+        self.assertTrue(np.all((positions[:, 0] > left)
+                               & (positions[:, 0] < right)
+                               & (positions[:, 1] > bottom)
+                               & (positions[:, 1] < top)))
 
 
 class EvaluationTests(RealDataTestCase):

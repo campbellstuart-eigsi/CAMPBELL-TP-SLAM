@@ -238,7 +238,9 @@ class LocalisationResult:
     def evaluate_against(self, true_pose, max_position_m=SUCCESS_POSITION_M,
                          max_angle_deg=SUCCESS_ANGLE_DEG):
         """A copy with the errors and success measured against true_pose."""
-        initial = pose_error(self.initial_pose, true_pose)
+        # A global search has no initial pose (None): no initial error.
+        initial = (pose_error(self.initial_pose, true_pose)
+                   if self.initial_pose is not None else (None, None))
         if self.pose is None:
             return replace(self, true_pose=tuple(true_pose),
                            initial_position_error_m=initial[0],

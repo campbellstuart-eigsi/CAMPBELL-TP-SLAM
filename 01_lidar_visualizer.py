@@ -1372,6 +1372,35 @@ def see_through_counts(viewer_points, other_points):
     return int(conflict.sum()), int(consistent.sum())
 
 
+def directional_conflicts(source, reference_scans, pose):
+    """free_space_conflict() split by WHO sees through whom.
+
+    Returns (pooled, scan_sees_through, reference_sees_through):
+        pooled                 - the value of free_space_conflict()
+        scan_sees_through      - share of compared reference points the NEW
+                                 scan sees through (its beams go past them)
+        reference_sees_through - share of the NEW scan's compared points that
+                                 a reference scan sees through
+    A wrong pose misplaces walls, so BOTH shares are high. A right pose with
+    furniture the reference recorded but the new scan saw past (another
+    LiDAR height, or the furniture was moved) raises only the first one.
+    """
+    placed = transform_points(source, pose)
+    counts = np.zeros(4, dtype=int)  # out conflicts, out consistent, in, in
+    for reference_local, reference_pose in reference_scans:
+        reference_global = transform_points(reference_local, reference_pose)
+        counts[:2] += see_through_counts(
+            source, global_to_local(reference_global, pose))
+        counts[2:] += see_through_counts(
+            reference_local, global_to_local(placed, reference_pose))
+
+    def share(conflicts, consistent):
+        return conflicts / (conflicts + consistent) if conflicts + consistent \
+            else 0.0
+    return (share(counts[0] + counts[2], counts[1] + counts[3]),
+            share(counts[0], counts[1]), share(counts[2], counts[3]))
+
+
 def free_space_conflict(source, reference_scans, pose):
     """Share of compared points where one scan "sees through" the other.
 
@@ -1401,6 +1430,30 @@ def alignment_score(match_fraction, conflict):
     return match_fraction - CONFLICT_PENALTY * conflict
 
 
+def one_sided_conflict(result):
+    """Too many conflicts, but only in the direction clutter can explain.
+
+    Allowed only with the "good" limits on everything else: at least
+    GOOD_MATCH_FRACTION matched, RMS within MAX_RMS_M, and the reference
+    scans see through at most GOOD_CONFLICT_FRACTION of the scan's points.
+    Never "good": the verdict is at best "weak" (check visually). Real
+    classroom data: 0 of 169 wrong candidate poses pass this, the falsely
+    rejected Scan 6 (sensor above the desks) does.
+    """
+    reference_sees_through = result.get("reference_sees_through")
+    return (result["conflict"] > MAX_CONFLICT_FRACTION
+            and reference_sees_through is not None
+            and reference_sees_through <= GOOD_CONFLICT_FRACTION
+            and result["match_fraction"] >= GOOD_MATCH_FRACTION
+            and result["rms_m"] <= MAX_RMS_M)
+
+
+def possible_pose(result):
+    """Not ruled out by free-space conflicts (see one_sided_conflict)."""
+    return result["conflict"] <= MAX_CONFLICT_FRACTION \
+        or one_sided_conflict(result)
+
+
 def judge_alignment(best, runner_up):
     """Return (status, reason): "good", "weak" (check visually) or "failed".
 
@@ -1408,7 +1461,8 @@ def judge_alignment(best, runner_up):
     "score"}; runner_up is the best CLEARLY DIFFERENT pose (or None).
     """
     fraction, rms = best["match_fraction"], best["rms_m"]
-    if best["conflict"] > MAX_CONFLICT_FRACTION:
+    one_sided = one_sided_conflict(best)
+    if best["conflict"] > MAX_CONFLICT_FRACTION and not one_sided:
         return "failed", (
             f"no consistent pose: even the best one makes the scan see "
             f"through {best['conflict']:.0%} of the reference walls (at "
@@ -1437,6 +1491,15 @@ def judge_alignment(best, runner_up):
                    if runner_up else "")
     summary = (f"{fraction:.0%} of points match, RMS {rms * 100:.1f} cm, "
                f"{best['conflict']:.0%} see-through conflicts{runner_text}")
+    if one_sided:
+        return "weak", (
+            f"plausible but CHECK VISUALLY: {summary}. The conflicts are "
+            f"ONE-SIDED: this scan sees past "
+            f"{best['scan_sees_through']:.0%} of the reference obstacles, "
+            f"but the reference scans see through only "
+            f"{best['reference_sees_through']:.0%} of this scan's points. "
+            f"Typical of a LiDAR placed higher than the others (it sees over "
+            f"desks) or of moved furniture; walls must coincide.")
     if (fraction >= GOOD_MATCH_FRACTION and rms <= GOOD_RMS_M
             and best["conflict"] <= GOOD_CONFLICT_FRACTION):
         return "good", f"good: {summary}."
@@ -1451,6 +1514,7 @@ def failed_alignment(reason, start_time):
     """A result dictionary for an alignment that could not be computed."""
     return {"status": "failed", "reason": reason, "pose": None,
             "match_fraction": 0.0, "rms_m": math.inf, "conflict": 0.0,
+            "scan_sees_through": 0.0, "reference_sees_through": 0.0,
             "score": 0.0, "runner_up": None,
             "runtime_s": time.perf_counter() - start_time}
 
@@ -1508,25 +1572,34 @@ def align_scan(source_local, reference_scans):
         pose = refine_by_search(source, fine_field, pose)
         pose = icp(icp_source, reference, pose)
         fraction, rms = evaluate_alignment(source, reference, pose)
-        conflict = free_space_conflict(source, reference_scans, pose)
-        refined.append({"pose": pose, "match_fraction": fraction,
-                        "rms_m": rms, "conflict": conflict,
-                        "score": alignment_score(fraction, conflict)})
+        conflict, scan_sees, reference_sees = directional_conflicts(
+            source, reference_scans, pose)
+        result = {"pose": pose, "match_fraction": fraction, "rms_m": rms,
+                  "conflict": conflict, "scan_sees_through": scan_sees,
+                  "reference_sees_through": reference_sees,
+                  "score": alignment_score(fraction, conflict)}
+        if one_sided_conflict(result):
+            # Only the conflicts clutter cannot explain count in its score.
+            result["score"] = alignment_score(fraction, reference_sees)
+        refined.append(result)
 
-    # Stage 3: impossible poses (too many conflicts) are ranked last, then
-    # the highest score wins. Runner-up = best clearly different one.
+    # Stage 3: impossible poses (too many conflicts) are ranked last, poses
+    # with one-sided conflicts after every ordinary possible pose, then the
+    # highest score wins. Runner-up = best clearly different possible one.
     refined.sort(key=lambda result: (
-        result["conflict"] > MAX_CONFLICT_FRACTION, -result["score"],
-        result["rms_m"]))
+        not possible_pose(result), one_sided_conflict(result),
+        -result["score"], result["rms_m"]))
     best = refined[0]
     runner_up = next((result for result in refined[1:]
-                      if result["conflict"] <= MAX_CONFLICT_FRACTION
+                      if possible_pose(result)
                       and poses_are_distinct(result["pose"], best["pose"])),
                      None)
     status, reason = judge_alignment(best, runner_up)
     return {"status": status, "reason": reason, "pose": best["pose"],
             "match_fraction": best["match_fraction"], "rms_m": best["rms_m"],
             "conflict": best["conflict"], "score": best["score"],
+            "scan_sees_through": best["scan_sees_through"],
+            "reference_sees_through": best["reference_sees_through"],
             "runner_up": runner_up,
             "runtime_s": time.perf_counter() - start_time}
 
@@ -2163,7 +2236,9 @@ def format_alignment_report(scan, proposal):
         lines.append(f"matched {result['match_fraction']:.0%} (within "
                      f"{MATCH_DISTANCE_M * 100:.0f} cm) | RMS "
                      f"{result['rms_m'] * 100:.1f} cm | see-through "
-                     f"{result['conflict']:.0%}")
+                     f"{result['conflict']:.0%} (scan past reference "
+                     f"{result['scan_sees_through']:.0%}, reference through "
+                     f"scan {result['reference_sees_through']:.0%})")
     lines += textwrap.wrap(result["reason"], 70)
     reference_names = ", ".join(str(scan_id)
                                 for scan_id in proposal["reference_ids"])
@@ -2705,6 +2780,9 @@ def create_session_editor(session, worker=None, start_message="",
             "match_fraction": round(result["match_fraction"], 4),
             "rms_m": round(result["rms_m"], 5),
             "conflict_fraction": round(result["conflict"], 4),
+            "scan_sees_through_fraction": round(result["scan_sees_through"], 4),
+            "reference_sees_through_fraction": round(
+                result["reference_sees_through"], 4),
             "score": round(result["score"], 4),
             "runner_up_score": (round(runner_up["score"], 4)
                                 if runner_up else None),
@@ -3941,6 +4019,40 @@ class AlignmentMathTests(unittest.TestCase):
         for best, runner_up, expected in cases:
             with self.subTest(best=best, runner_up=runner_up):
                 self.assertEqual(judge_alignment(best, runner_up)[0], expected)
+
+    def test_one_sided_conflicts_need_check_visually_never_good(self):
+        # Real Scan 6 (LiDAR above the desks): 49 % pooled conflicts, but
+        # the reference scans see through only 2 % of its points.
+        def result(match, rms, pooled, reference_sees):
+            return {"pose": (0.0, 0.0, 0.0), "match_fraction": match,
+                    "rms_m": rms, "conflict": pooled,
+                    "scan_sees_through": 0.63,
+                    "reference_sees_through": reference_sees,
+                    "score": alignment_score(match, reference_sees)}
+        cases = [
+            (result(0.53, 0.037, 0.49, 0.02), "weak"),
+            (result(0.95, 0.010, 0.49, 0.02), "weak"),    # never "good"
+            (result(0.53, 0.037, 0.49, 0.15), "failed"),  # two-sided
+            (result(0.45, 0.037, 0.49, 0.02), "failed"),  # too little match
+            (result(0.53, 0.050, 0.49, 0.02), "failed"),  # loose fit
+        ]
+        for best, expected in cases:
+            with self.subTest(best=best):
+                status, reason = judge_alignment(best, None)
+                self.assertEqual(status, expected)
+                if expected == "weak":
+                    self.assertIn("ONE-SIDED", reason)
+
+    def test_directional_conflicts_pool_like_free_space_conflict(self):
+        source, reference = make_alignment_case(
+            CLASSROOM_WALLS, (2.0, 2.5, 30.0), (4.0, 3.0, 100.0), seed=3)
+        for pose in ((4.0, 3.0, 100.0), (4.5, 2.0, 280.0)):
+            pooled, scan_sees, reference_sees = directional_conflicts(
+                source, reference, pose)
+            self.assertEqual(pooled, free_space_conflict(source, reference,
+                                                         pose))
+            self.assertTrue(0.0 <= scan_sees <= 1.0
+                            and 0.0 <= reference_sees <= 1.0)
 
 
 class AlignmentScenarioTests(unittest.TestCase):
