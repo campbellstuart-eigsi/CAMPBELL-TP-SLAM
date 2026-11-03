@@ -684,32 +684,184 @@ def teleplot_to_sensor_frame(x_mm, y_mm, y_points_right=TELEPLOT_Y_POINTS_RIGHT)
     return x_m, y_m
 
 
+# ---------------------------------------------------------------------------
+# CSV scans sent by the same library (ld06.printScanCSV)
+# ---------------------------------------------------------------------------
+# A header line, printed ONCE after the ESP32 boots:
+#     N,Angle(°),Distance(mm),Intensity,x(mm),y(mm)
+# then one line PER POINT, and an EMPTY line after each complete scan:
+#     0,0.38,1320,229,1319,-8
+#     1,1.10,1336,231,1335,-25
+#     ...
+#     <empty line>
+# Columns: index, angle (degrees, ALREADY counter-clockwise), distance (mm),
+# intensity, then x and y (mm) only when ld06.h defines LD06_COMPUTE_XY.
+# x and y are the SAME library values as in the Teleplot line (+Y = RIGHT),
+# so both formats go through teleplot_to_sensor_frame(). Without them
+# (4 columns) they are computed with the ld06.cpp formulas:
+#     x =  distance * cos(angle)        y = -distance * sin(angle)
+FORMAT_TELEPLOT = "teleplot_xy"
+FORMAT_CSV_XY = "csv_6"
+FORMAT_CSV_POLAR = "csv_4"
+FORMAT_LABELS = {
+    None: "no LiDAR format detected yet",
+    FORMAT_TELEPLOT: "Teleplot XY (printScanTeleplot)",
+    FORMAT_CSV_XY: "LD06 CSV, 6 columns with x/y (printScanCSV)",
+    FORMAT_CSV_POLAR: "LD06 CSV, 4 columns without x/y (printScanCSV)",
+}
+CSV_HEADER_PREFIX = "N,"
+LD06_MAX_DISTANCE_MM = 65535  # uint16_t distance in ld06.h
+
+
+def parse_ld06_csv_row(line):
+    """Parse one printScanCSV point line; return (fmt, index, x_mm, y_mm).
+
+    fmt is FORMAT_CSV_XY or FORMAT_CSV_POLAR; x_mm, y_mm are in the LIBRARY
+    frame (+Y = right), like a Teleplot point. Returns None if the line is
+    not a valid 4- or 6-column row: wrong column count, non-numbers,
+    a negative or fractional index, an angle outside 0..360 degrees or a
+    distance outside 0..65535 mm.
+    """
+    fields = line.strip().split(",")
+    if len(fields) not in (4, 6):
+        return None
+    values = [parse_finite_number(field) for field in fields]
+    if any(value is None for value in values):
+        return None
+    index, angle_deg, distance_mm = values[0], values[1], values[2]
+    if (index < 0 or index != int(index) or not 0.0 <= angle_deg <= 360.0
+            or not 0.0 <= distance_mm <= LD06_MAX_DISTANCE_MM):
+        return None
+    if len(fields) == 6:
+        return FORMAT_CSV_XY, int(index), values[4], values[5]
+    angle_rad = math.radians(angle_deg)
+    return (FORMAT_CSV_POLAR, int(index), distance_mm * math.cos(angle_rad),
+            -distance_mm * math.sin(angle_rad))
+
+
+def is_csv_candidate(line):
+    """True if `line` looks like a printScanCSV point row (maybe corrupted).
+
+    Teleplot lines (">...") and text without commas (e.g. "New scan
+    completed.") are other output, not CSV rows, and are ignored.
+    """
+    return "," in line and not line.startswith(">")
+
+
+class CsvScanAssembler:
+    """Join printScanCSV point rows into scans; an empty line ends a scan.
+
+    The capture may start in the MIDDLE of a scan, so the rows before the
+    first empty line (or header) are an INCOMPLETE scan and are discarded:
+    the first scan returned started after the capture began. A scan is also
+    discarded when a row is missing (row index != its position: a line was
+    lost) or when its rows change column count. A scan still unfinished
+    when the capture stops is never returned.
+    """
+
+    def __init__(self):
+        self.synchronised = False  # True once a scan boundary was seen
+        self.start_scan()
+
+    def start_scan(self):
+        self.x_mm, self.y_mm = [], []
+        self.rows = 0         # all rows of this scan, valid or not
+        self.malformed = 0
+        self.format = None    # column count of the scan's first valid row
+        self.complete = True  # becomes False if a row is missing
+
+    def add_line(self, line):
+        """Feed one line; return a finished scan dictionary or None.
+
+        The dictionary has "x_mm", "y_mm" (NumPy arrays, library frame),
+        "malformed", "format" and "complete" (False = rows were missing).
+        """
+        line = line.strip()
+        if line.startswith(CSV_HEADER_PREFIX):  # ESP32 (re)booted
+            self.synchronised = True
+            self.start_scan()
+            return None
+        if not line:
+            finished = self.finish_scan()
+            self.synchronised = True
+            self.start_scan()
+            return finished
+        if not is_csv_candidate(line):
+            return None
+        position = self.rows
+        self.rows += 1
+        parsed = parse_ld06_csv_row(line)
+        if parsed is None or parsed[0] != (self.format or parsed[0]):
+            self.malformed += 1  # bad row, or 4 and 6 columns mixed
+            return None
+        self.format, index, x_mm, y_mm = parsed
+        if index != position:
+            self.complete = False
+        self.x_mm.append(x_mm)
+        self.y_mm.append(y_mm)
+        return None
+
+    def finish_scan(self):
+        if not self.synchronised or self.rows == 0:
+            return None  # partial scan from before the capture, or no rows
+        return {"x_mm": np.array(self.x_mm, dtype=float),
+                "y_mm": np.array(self.y_mm, dtype=float),
+                "malformed": self.malformed, "complete": self.complete,
+                "format": self.format}
+
+
 def new_capture_report(stop_reason="timeout"):
     """Return the counters filled in by capture_teleplot_scans()."""
     return {"bytes": 0, "lines": 0, "rejected_scans": 0,
-            "malformed_entries": 0, "stop_reason": stop_reason}
+            "malformed_entries": 0, "stop_reason": stop_reason,
+            "format": None, "incomplete_scans": 0}
 
 
 def capture_teleplot_scans(connection, scan_count, timeout_s,
                            name=TELEPLOT_SCAN_NAME, clock=time.monotonic,
-                           stop_event=None):
-    """Read serial text until `scan_count` complete XY scans have arrived.
+                           stop_event=None, on_format=None):
+    """Read serial text until `scan_count` complete scans have arrived.
+
+    Both library output formats are accepted, detected line by line:
+    Teleplot XY (one ">lidar:...|xy" line per scan) and CSV (one row per
+    point, an empty line after each scan; 6 or 4 columns).
 
     connection - an OPEN serial port, or any object with read(size) -> bytes
                  (the tests use a fake one)
     timeout_s  - give up after this many seconds in total
     clock      - time source in seconds (the tests use a fake clock)
     stop_event - optional threading.Event: when set, stop early ("cancelled")
+    on_format  - optional on_format(fmt), called (on THIS thread) whenever
+                 the detected format changes; fmt is a FORMAT_LABELS key
 
-    Returns (scans, report). `scans` is a list of (x_mm, y_mm) arrays and
-    may be SHORTER than scan_count. `report` counts what was received and
-    gives the "stop_reason": "complete", "timeout", "cancelled" or
+    Returns (scans, report). `scans` is a list of (x_mm, y_mm) arrays in the
+    library frame (whatever the format) and may be SHORTER than scan_count.
+    `report` counts what was received, gives the last detected "format"
+    and the "stop_reason": "complete", "timeout", "cancelled" or
     "disconnected: ...".
     """
     buffer = bytearray()  # a NEW buffer: bytes from earlier reads are ignored
+    csv_scans = CsvScanAssembler()
     scans = []
     report = new_capture_report()
     deadline = clock() + timeout_s
+
+    def detected(fmt):
+        if fmt is not None and fmt != report["format"]:
+            report["format"] = fmt
+            if on_format is not None:
+                on_format(fmt)
+
+    def accept(x_mm, y_mm, malformed):
+        """Apply the same quality rules to a scan of either format."""
+        report["malformed_entries"] += malformed
+        entries = len(x_mm) + malformed
+        points_with_echo = np.count_nonzero((x_mm != 0) | (y_mm != 0))
+        if (points_with_echo < MIN_POINTS_PER_REAL_SCAN
+                or malformed > MAX_MALFORMED_FRACTION * entries):
+            report["rejected_scans"] += 1
+            return
+        scans.append((x_mm, y_mm))
 
     while len(scans) < scan_count and clock() < deadline:
         if stop_event is not None and stop_event.is_set():
@@ -726,17 +878,22 @@ def capture_teleplot_scans(connection, scan_count, timeout_s,
         for line in split_complete_lines(buffer):
             report["lines"] += 1
             parsed = parse_teleplot_xy_line(line, name)
-            if parsed is None:
-                continue  # not a complete scan line: ignore it
-            x_mm, y_mm, malformed = parsed
-            report["malformed_entries"] += malformed
-            entries = len(x_mm) + malformed
-            points_with_echo = np.count_nonzero((x_mm != 0) | (y_mm != 0))
-            if (points_with_echo < MIN_POINTS_PER_REAL_SCAN
-                    or malformed > MAX_MALFORMED_FRACTION * entries):
-                report["rejected_scans"] += 1
-                continue
-            scans.append((x_mm, y_mm))
+            if parsed is not None:
+                detected(FORMAT_TELEPLOT)
+                accept(*parsed)
+            else:
+                # Not a complete Teleplot line: maybe a CSV row or boundary.
+                if is_csv_candidate(line):
+                    row = parse_ld06_csv_row(line)
+                    detected(row[0] if row is not None else None)
+                finished = csv_scans.add_line(line)
+                if finished is not None:
+                    if not finished["complete"]:
+                        report["incomplete_scans"] += 1
+                        report["rejected_scans"] += 1
+                    else:
+                        accept(finished["x_mm"], finished["y_mm"],
+                               finished["malformed"])
             if len(scans) == scan_count:
                 break
 
@@ -751,6 +908,7 @@ def print_capture_report(scans, report, scan_count):
           f"lines, {len(scans)}/{scan_count} valid scans "
           f"({report['rejected_scans']} rejected, "
           f"{report['malformed_entries']} malformed entries skipped).")
+    print(f"Serial format: {FORMAT_LABELS[report['format']]}")
     print(f"Stop reason: {report['stop_reason']}")
     if len(scans) == scan_count:
         return
@@ -760,9 +918,14 @@ def print_capture_report(scans, report, scan_count):
         print("  Nothing received: is the ESP32 powered and running the "
               "firmware? Is another program (Arduino Serial Monitor, "
               "Teleplot) using the port?")
-    elif not scans and report["rejected_scans"] == 0:
-        print(f"  Text received but no '>{TELEPLOT_SCAN_NAME}:...|xy' "
-              f"line: run RUN_MODE = 'serial_diagnostic' to see the format.")
+    elif not scans and report["format"] is None:
+        print(f"  Text received but no '>{TELEPLOT_SCAN_NAME}:...|xy' line "
+              f"and no LD06 CSV row: run diagnose_lidar_serial.py to see "
+              f"the format.")
+    elif report["incomplete_scans"]:
+        print(f"  {report['incomplete_scans']} CSV scan(s) had missing rows "
+              f"(serial data lost): check the USB cable, or increase "
+              f"CAPTURE_TIMEOUT_S.")
     else:
         print("  Too few scans before the timeout: increase "
               "CAPTURE_TIMEOUT_S, or check that the LiDAR is spinning.")
@@ -805,6 +968,7 @@ def serial_worker_loop(worker, timeout_s):
     first bytes after that are the end of a line already in progress: they
     do not start with ">lidar:" so they are rejected. The first ACCEPTED
     line therefore started after the click, while the robot was still.
+    (CSV: the rows before the first empty line are discarded the same way.)
     """
     connection = worker["connection"]
     while not worker["stop"].is_set():
@@ -1515,22 +1679,38 @@ def failed_alignment(reason, start_time):
     return {"status": "failed", "reason": reason, "pose": None,
             "match_fraction": 0.0, "rms_m": math.inf, "conflict": 0.0,
             "scan_sees_through": 0.0, "reference_sees_through": 0.0,
-            "score": 0.0, "runner_up": None,
+            "score": 0.0, "runner_up": None, "coarse_pose": None,
             "runtime_s": time.perf_counter() - start_time}
 
 
-def align_scan(source_local, reference_scans):
+class AlignmentCancelled(Exception):
+    """Raised by align_scan() when its should_stop() callback returns True."""
+
+
+ALIGN_HEADING_BATCH = 10  # headings scored between progress / cancel checks
+
+
+def align_scan(source_local, reference_scans, search_window=None,
+               progress=None, should_stop=None):
     """Estimate the pose of a scan on the reference map (any rotation).
 
     source_local    - (N, 2) ORIGINAL local points of the scan to align
     reference_scans - list of (local_points, pose) of the already aligned
                       scans; together they form the reference map
+    search_window   - None (default): the whole reference area and every
+                      heading, as Auto Align always did. Or (x_m, y_m,
+                      theta_deg, half_width_m, half_angle_deg): only poses
+                      within that window around a guess (local search).
+    progress(fraction), should_stop() - optional callbacks for a GUI;
+                      should_stop() returning True raises AlignmentCancelled.
+    With the default arguments the result is exactly the original one.
     Neither input is modified. Returns a dictionary:
         "status"    - "good", "weak" or "failed" (see judge_alignment)
         "reason"    - one sentence explaining the status
         "pose"      - best pose found (x_m, y_m, theta_deg), or None
         "match_fraction", "rms_m", "conflict", "score" - quality of it
         "runner_up" - best clearly different pose (dict) or None
+        "coarse_pose" - the coarse-search pose the answer was refined from
         "runtime_s" - computation time
     The robot is assumed to stand somewhere inside the area covered by
     the reference points (true when it stays in the same classroom).
@@ -1551,15 +1731,37 @@ def align_scan(source_local, reference_scans):
             f"{ALIGN_VOXEL_M * 100:.0f} cm; {MIN_ALIGN_POINTS} needed).",
             start_time)
 
-    # Stage 1a: coarse search, ALL headings, whole reference area.
+    def check_stop():
+        if should_stop is not None and should_stop():
+            raise AlignmentCancelled
+
+    # Stage 1a: coarse search, ALL headings, whole reference area (or the
+    # local window). Headings are scored in batches: same scores, but a GUI
+    # can show progress and cancel between batches.
     coarse_field = build_likelihood_field(reference, ALIGN_COARSE_CELL_M,
                                           ALIGN_COARSE_SIGMA_M)
-    low, high = reference.min(axis=0), reference.max(axis=0)
-    positions = position_grid((low[0], high[0]), (low[1], high[1]),
-                              ALIGN_COARSE_STEP_M)
-    headings = np.arange(0.0, 360.0, ALIGN_COARSE_STEP_DEG)
-    scores = correlative_search(voxel_downsample(source, ALIGN_COARSE_STEP_M),
-                                coarse_field, headings, positions)
+    if search_window is None:
+        low, high = reference.min(axis=0), reference.max(axis=0)
+        positions = position_grid((low[0], high[0]), (low[1], high[1]),
+                                  ALIGN_COARSE_STEP_M)
+        headings = np.arange(0.0, 360.0, ALIGN_COARSE_STEP_DEG)
+    else:
+        x, y, theta, half_width, half_angle = search_window
+        positions = position_grid((x - half_width, x + half_width),
+                                  (y - half_width, y + half_width),
+                                  ALIGN_COARSE_STEP_M)
+        headings = theta + np.arange(-half_angle, half_angle + 1e-9,
+                                     ALIGN_COARSE_STEP_DEG)
+    coarse_source = voxel_downsample(source, ALIGN_COARSE_STEP_M)
+    scores = np.empty((len(headings), len(positions)))
+    for first in range(0, len(headings), ALIGN_HEADING_BATCH):
+        check_stop()
+        batch = slice(first, first + ALIGN_HEADING_BATCH)
+        scores[batch] = correlative_search(coarse_source, coarse_field,
+                                           headings[batch], positions)
+        if progress is not None:
+            progress(0.6 * min(1.0, (first + ALIGN_HEADING_BATCH)
+                               / len(headings)))
     candidates = pick_distinct_poses(scores, headings, positions,
                                      ALIGN_CANDIDATES)
 
@@ -1568,8 +1770,9 @@ def align_scan(source_local, reference_scans):
                                         ALIGN_FINE_SIGMA_M)
     icp_source = voxel_downsample(source, ALIGN_ICP_VOXEL_M)
     refined = []
-    for pose, _ in candidates:
-        pose = refine_by_search(source, fine_field, pose)
+    for number, (coarse_pose, _) in enumerate(candidates):
+        check_stop()
+        pose = refine_by_search(source, fine_field, coarse_pose)
         pose = icp(icp_source, reference, pose)
         fraction, rms = evaluate_alignment(source, reference, pose)
         conflict, scan_sees, reference_sees = directional_conflicts(
@@ -1577,11 +1780,14 @@ def align_scan(source_local, reference_scans):
         result = {"pose": pose, "match_fraction": fraction, "rms_m": rms,
                   "conflict": conflict, "scan_sees_through": scan_sees,
                   "reference_sees_through": reference_sees,
-                  "score": alignment_score(fraction, conflict)}
+                  "score": alignment_score(fraction, conflict),
+                  "coarse_pose": coarse_pose}
         if one_sided_conflict(result):
             # Only the conflicts clutter cannot explain count in its score.
             result["score"] = alignment_score(fraction, reference_sees)
         refined.append(result)
+        if progress is not None:
+            progress(0.6 + 0.4 * (number + 1) / len(candidates))
 
     # Stage 3: impossible poses (too many conflicts) are ranked last, poses
     # with one-sided conflicts after every ordinary possible pose, then the
@@ -1600,7 +1806,7 @@ def align_scan(source_local, reference_scans):
             "conflict": best["conflict"], "score": best["score"],
             "scan_sees_through": best["scan_sees_through"],
             "reference_sees_through": best["reference_sees_through"],
-            "runner_up": runner_up,
+            "runner_up": runner_up, "coarse_pose": best["coarse_pose"],
             "runtime_s": time.perf_counter() - start_time}
 
 
@@ -2696,7 +2902,7 @@ def create_session_editor(session, worker=None, start_message="",
                            f"align selected.")
             select_scan(scan["id"])
             fit_view()
-            show_message(message)
+            show_message(f"{message} [{FORMAT_LABELS[report['format']]}]")
 
     def auto_align_selected():
         """Start aligning the selected scan in a background thread."""
@@ -3215,6 +3421,34 @@ def chop(data, size):
     return [data[i:i + size] for i in range(0, len(data), size)]
 
 
+# Two rows exactly as printed by the robot's ESP32 (ld06.printScanCSV).
+REAL_CSV_ROWS = ("404,40.08,775,229,592,-499", "405,39.36,775,232,599,-491")
+CSV_HEADER = "N,Angle(°),Distance(mm),Intensity,x(mm),y(mm)"
+
+
+def make_csv_scan(points, with_xy=True, first_index=0):
+    """Build the bytes ld06.printScanCSV() sends for one scan.
+
+    points - (x_mm, y_mm) library-frame integers; angle and distance are
+    derived with the ld06.cpp convention (y = -distance * sin(angle)).
+    """
+    rows = []
+    for number, (x, y) in enumerate(points, start=first_index):
+        distance = round(math.hypot(x, y))
+        angle = math.degrees(math.atan2(-y, x)) % 360.0
+        row = f"{number},{angle:.2f},{distance},200"
+        rows.append(row + (f",{x},{y}" if with_xy else ""))
+    return ("\r\n".join(rows) + "\r\n\r\n").encode("utf-8")
+
+
+def recorded_scan_as_library_points(scan_index=0):
+    """A REAL recorded LD06 scan, back in the library frame (int mm)."""
+    with open(SCANS_DIR / "classroom_final.json", encoding="utf-8") as handle:
+        local_m = np.array(json.load(handle)["scans"][scan_index]["points_local_m"])
+    points = [(int(round(x * 1000)), int(round(-y * 1000))) for x, y in local_m]
+    return local_m, points
+
+
 class TeleplotParserTests(unittest.TestCase):
     def test_parses_signed_points(self):
         parsed = parse_teleplot_xy_line(">lidar:1320:16;-250:-3;0:-1200;|xy")
@@ -3350,6 +3584,165 @@ class CaptureTests(unittest.TestCase):
                                                clock=FakeClock())
         self.assertEqual(len(scans), 1)
         self.assertEqual(report["rejected_scans"], 3)
+
+
+class CsvRowTests(unittest.TestCase):
+    def test_real_six_column_rows(self):
+        self.assertEqual(parse_ld06_csv_row(REAL_CSV_ROWS[0]),
+                         (FORMAT_CSV_XY, 404, 592.0, -499.0))
+        self.assertEqual(parse_ld06_csv_row(REAL_CSV_ROWS[1] + "\r"),
+                         (FORMAT_CSV_XY, 405, 599.0, -491.0))
+
+    def test_real_rows_are_not_teleplot_lines(self):
+        for row in REAL_CSV_ROWS:
+            self.assertIsNone(parse_teleplot_xy_line(row))
+
+    def test_four_columns_use_the_library_formula(self):
+        # The same real rows without x/y must give the x/y the ESP32 sent
+        # (the library stores them as int16, so up to 1 mm truncation).
+        for row in REAL_CSV_ROWS:
+            _, index6, x6, y6 = parse_ld06_csv_row(row)
+            fmt, index4, x4, y4 = parse_ld06_csv_row(row.rsplit(",", 2)[0])
+            self.assertEqual((fmt, index4), (FORMAT_CSV_POLAR, index6))
+            self.assertAlmostEqual(x4, x6, delta=1.0)
+            self.assertAlmostEqual(y4, y6, delta=1.0)
+
+    def test_orientation_in_sensor_frame(self):
+        # CSV angles are already counter-clockwise: 0 = front, 90 = left.
+        for row, expected in (("0,0.00,1000,200", (1.0, 0.0)),
+                              ("1,90.00,1000,200", (0.0, 1.0)),
+                              ("2,270.00,1000,200", (0.0, -1.0)),
+                              ("3,90.00,1000,200,0,-1000", (0.0, 1.0)),
+                              (REAL_CSV_ROWS[0], (0.592, 0.499))):
+            _, _, x_mm, y_mm = parse_ld06_csv_row(row)
+            x_m, y_m = teleplot_to_sensor_frame(np.array([x_mm]),
+                                                np.array([y_mm]))
+            np.testing.assert_allclose([x_m[0], y_m[0]], expected,
+                                       atol=1e-9, err_msg=row)
+
+    def test_invalid_rows_are_rejected(self):
+        for row in ("", CSV_HEADER, "1,2,3", "1,2,3,4,5", "1,2,3,4,5,6,7",
+                    "a,1.0,100,5", "1,nan,100,5", "1,10,100,5,inf,2",
+                    "-1,10,100,5", "1.5,10,100,5", "1,400,100,5",
+                    "1,10,-5,5", "1,10,70000,5", "1,10,,5", "40,4�.08,775,229",
+                    "rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)"):
+            self.assertIsNone(parse_ld06_csv_row(row), row)
+
+
+class CsvCaptureTests(unittest.TestCase):
+    def capture(self, stream, count=1, chunk=None, **options):
+        chunks = chop(stream, chunk) if chunk else [stream]
+        return capture_teleplot_scans(FakeSerial(chunks), count, 1000.0,
+                                      clock=FakeClock(), **options)
+
+    def test_blank_line_ends_scan_and_partial_first_scan_is_discarded(self):
+        partial = make_csv_scan(make_test_points(60, 50), first_index=300)
+        stream = (b"5,229,592,-499\r\n"[3:]         # port opened mid-row
+                  + partial
+                  + make_csv_scan(make_test_points(60))
+                  + make_csv_scan(make_test_points(70, 1)))
+        scans, report = self.capture(stream, count=2, chunk=7)
+        self.assertEqual(report["stop_reason"], "complete")
+        self.assertEqual(report["format"], FORMAT_CSV_XY)
+        self.assertEqual([len(x) for x, _ in scans], [60, 70])
+        self.assertEqual((scans[0][0][0], scans[0][1][0]), (1000, -500))
+        self.assertEqual(report["rejected_scans"], 0)
+
+    def test_header_after_boot_starts_a_scan(self):
+        stream = (CSV_HEADER + "\r\n").encode() + make_csv_scan(make_test_points(60))
+        scans, report = self.capture(stream)
+        self.assertEqual((len(scans), report["stop_reason"]), (1, "complete"))
+
+    def test_unfinished_scan_is_never_returned(self):
+        stream = b"\r\n" + make_csv_scan(make_test_points(60))[:-2]  # no blank
+        scans, report = self.capture(stream)
+        self.assertEqual((scans, report["stop_reason"]), ([], "timeout"))
+        self.assertEqual(report["format"], FORMAT_CSV_XY)  # still displayed
+
+    def test_scan_with_a_lost_row_is_rejected(self):
+        rows = make_csv_scan(make_test_points(60)).split(b"\r\n")
+        del rows[20]                                       # row 20 lost
+        stream = b"\r\n" + b"\r\n".join(rows) + make_csv_scan(make_test_points(60, 1))
+        scans, report = self.capture(stream)
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(scans[0][0][0], 1001)  # the second, complete scan
+        self.assertEqual((report["incomplete_scans"], report["rejected_scans"]), (1, 1))
+
+    def test_malformed_rows_skipped_or_scan_rejected(self):
+        rows = make_csv_scan(make_test_points(100)).split(b"\r\n")
+        few = list(rows)
+        few[10] = b"10,1\xff.5,1000,200,1000,-17"           # corrupted byte
+        few[11] = b"11,1.5,1000,200"                       # 4 cols in 6-col scan
+        many = list(rows)
+        for i in range(0, 60, 6):
+            many[i] = b"%d,x,1,2,3,4" % i                   # 10 % bad rows
+        stream = b"\r\n" + b"\r\n".join(many) + b"\r\n".join(few)
+        scans, report = self.capture(stream)
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(len(scans[0][0]), 98)
+        self.assertEqual(report["rejected_scans"], 1)
+        self.assertEqual(report["malformed_entries"], 12)
+
+    def test_too_few_echoes_rejected(self):
+        stream = (b"\r\n" + make_csv_scan(make_test_points(10))
+                  + b"\r\n".join(b"%d,%.2f,0,0,0,0" % (i, i * 0.8)
+                                 for i in range(100)) + b"\r\n\r\n")
+        scans, report = self.capture(stream)
+        self.assertEqual((scans, report["rejected_scans"]), ([], 2))
+
+    def test_four_column_scans(self):
+        points = make_test_points(60)
+        stream = b"\r\n" + make_csv_scan(points, with_xy=False)
+        changes = []
+        scans, report = self.capture(stream, chunk=11, on_format=changes.append)
+        self.assertEqual((report["format"], changes), (FORMAT_CSV_POLAR, [FORMAT_CSV_POLAR]))
+        # Distance is sent in whole mm and angle to 0.01 deg: <= 0.6 mm here.
+        np.testing.assert_allclose(scans[0][0], [p[0] for p in points], atol=0.8)
+        np.testing.assert_allclose(scans[0][1], [p[1] for p in points], atol=0.8)
+
+    def test_format_detection_and_switching(self):
+        changes = []
+        stream = (make_teleplot_line(make_test_points(60))
+                  + b"\r\n" + make_csv_scan(make_test_points(60, 1)))
+        scans, report = self.capture(stream, count=2, on_format=changes.append)
+        self.assertEqual(len(scans), 2)
+        self.assertEqual(changes, [FORMAT_TELEPLOT, FORMAT_CSV_XY])
+        _, report = self.capture(make_teleplot_line(make_test_points(60)))
+        self.assertEqual(report["format"], FORMAT_TELEPLOT)
+        _, report = self.capture(b"ets Jul 29 2019\r\n>speed:3\r\nNew scan completed.\r\n")
+        self.assertIsNone(report["format"])
+
+    def test_real_recorded_scan_replayed_as_csv(self):
+        # A real classroom LD06 scan, re-sent as the ESP32 would send it in
+        # both CSV variants, must come back as the recorded sensor points.
+        local_m, points = recorded_scan_as_library_points()
+        for with_xy, tolerance_m in ((True, 0.0006), (False, 0.0016)):
+            stream = (b"412,40.08,775,229,592,-499\r\n\r\n"
+                      + make_csv_scan(points, with_xy))
+            scans, report = self.capture(stream, chunk=64)
+            self.assertEqual(report["stop_reason"], "complete")
+            x_m, y_m = teleplot_to_sensor_frame(*scans[0])
+            np.testing.assert_allclose(np.column_stack((x_m, y_m)), local_m,
+                                       atol=tolerance_m)
+
+    def test_csv_matches_teleplot_for_the_same_scan(self):
+        _, points = recorded_scan_as_library_points(1)
+        csv_scans, _ = self.capture(b"\r\n" + make_csv_scan(points))
+        teleplot_scans, _ = self.capture(make_teleplot_line(points))
+        for csv_part, teleplot_part in zip(csv_scans[0], teleplot_scans[0]):
+            np.testing.assert_array_equal(csv_part, teleplot_part)
+
+    def test_serial_worker_accepts_csv(self):
+        stream = (b"404,40.08,775,229,592,-499\r\n\r\n"
+                  + make_csv_scan(make_test_points(60)))
+        worker = start_serial_worker(FakeSerial(chop(stream, 100)))
+        try:
+            worker["requests"].put(("add", None))
+            request, scans, report = worker["results"].get(timeout=3.0)
+        finally:
+            stop_serial_worker(worker)
+        self.assertEqual((request, len(scans), report["format"]),
+                         (("add", None), 1, FORMAT_CSV_XY))
 
 
 class ExistingFeatureTests(unittest.TestCase):

@@ -15,11 +15,14 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 import localisation_common as common
 from app_session import (SharedSession, CaptureAdapter, build_grid, build_vectors,
-                         part1, part2, part3, grid_localisation as loc)
+                         part1, part2, part3, grid_localisation as loc,
+                         vector_localisation as vloc, scan_localisation as sloc)
 
 BG, PANEL, ACCENT, TEXT, MUTED = "#0F1B2A", "#192B3D", "#39B5A5", "#EDF3F6", "#A4B8C9"
 PROJECT = Path(__file__).resolve().parent
@@ -470,6 +473,12 @@ RESULT_ADVICE = {
                  "symmetric part of the room. Capture from a spot that sees distinctive features.",
     "out_of_map": "Not localised: most points fall outside the map at the best pose.",
     "cancelled": "Search cancelled.",
+    "insufficient_overlap": "Not localised: too few points match the reference. A single reference "
+                            "scan may see another part of the room: choose a nearer one or the "
+                            "accumulated reference.",
+    "inconsistent": "Not localised: even the best pose makes the scans see through each other's walls.",
+    "poor_fit": "Not localised: the matched points are too far from the reference (RMS).",
+    "failed": "Not localised.",
     "weak": "Plausible but not confirmed: check that the faded points lie on the walls, or capture "
             "again from a spot with more distinctive features. Do not treat it as a position fix.",
     "insufficient_points": "Capture again: too few usable points.",
@@ -812,11 +821,480 @@ class SharedBuild:
                 page.set_info(text)
 
 
+class NewScanLocalisationPage(Page):
+    """Shared page for localising ONE new scan on a fixed reference (Codes 05, 06).
+
+    Subclasses give the reference: reference_controls(), draw_reference(),
+    compute() and measure_lines(). The new scan keeps its sensor-frame
+    points; it is never added to the reference or the session.
+    """
+    TITLE = DESCRIPTION = REFERENCE_NAME = ""
+    SEARCHES = LocalisationPage.SEARCHES
+    SEARCH_NOTES = ("", "")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.reference_ready = False
+        self.target = None          # (local points, name): never added to the map
+        self.targets = []
+        self.result = None
+        self.guess = (0.0, 0.0, 0.0)
+        self.generation = 0
+        self.stop = threading.Event()
+        self.progress = self.shown_progress = None
+        section(self.controls, self.TITLE)
+        note(self.controls, self.DESCRIPTION)
+        note(self.controls, "Coordinate reference: Scan 1 (0, 0, 0°)", style="Section.TLabel")
+        self.reference_controls(self.controls)
+        self.capture_controls(self.captured)
+        button(self.controls, "Load Recorded Scan", self.choose_recorded)
+        self.target_choice = ttk.Combobox(self.controls, state="readonly")
+        self.target_choice.pack(fill="x", pady=4)
+        self.target_choice.bind("<<ComboboxSelected>>", self.choose_target)
+        section(self.controls, "Search")
+        self.search = ttk.Combobox(self.controls, state="readonly", values=self.SEARCHES)
+        self.search.set(self.SEARCHES[0])
+        self.search.pack(fill="x", pady=4)
+        self.search.bind("<<ComboboxSelected>>", self.change_search)
+        self.search_note = note(self.controls, self.SEARCH_NOTES[0])
+        self.action_row = ttk.Frame(self.controls)
+        self.action_row.pack(fill="x", pady=3)
+        self.localise_button = ttk.Button(self.action_row, text="Localise", command=self.localise)
+        self.localise_button.pack(side="left", fill="x", expand=True)
+        ttk.Button(self.action_row, text="Cancel", command=self.cancel_search).pack(side="left", padx=(4, 0))
+        self.local_controls = ttk.Frame(self.controls)
+        section(self.local_controls, "Initial pose (local search)")
+        self.pose = PoseInputs(self.local_controls, lambda: vloc.pose_to_day1(self.guess),
+                               self.set_pose)
+        note(self.local_controls, "Left click on map: position\nRight click: point heading toward cursor")
+        section(self.controls, "Result")
+        self.result_label = note(self.controls, "Load a separate scan or capture one to begin.")
+
+    # -- hooks ------------------------------------------------------------------
+    def reference_controls(self, parent):
+        pass
+
+    def draw_reference(self, ax):
+        """Draw the reference; return its legend handles and (x, y) limits."""
+        raise NotImplementedError
+
+    def compute(self, points, initial, report, should_stop):
+        raise NotImplementedError
+
+    def measure_lines(self, result):
+        return []
+
+    # -- plot ---------------------------------------------------------------------
+    def setup_plot(self):
+        """Create the map once the reference is available."""
+        ax = self.axes = self.figure.add_subplot(111)
+        handles, (xlim, ylim) = self.draw_reference(ax)
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        ax.plot([0], [0], "+", color="tab:green", markersize=14, mew=2, zorder=6)
+        ax.annotate("Scan 1 (0, 0, 0°)", (0, 0), (6, -14), textcoords="offset points",
+                    fontsize=8, color="tab:green")
+        self.initial_points = ax.scatter(np.empty(0), np.empty(0), s=5, color="tab:orange", zorder=3)
+        self.aligned_points = ax.scatter(np.empty(0), np.empty(0), s=6, color="tab:blue", zorder=4)
+        self.runner_points = ax.scatter(np.empty(0), np.empty(0), s=5, color="tab:purple",
+                                        alpha=0.6, zorder=3)
+        self.initial_marker = loc.pose_marker(ax, "tab:orange")
+        self.aligned_marker = loc.pose_marker(ax, "tab:blue")
+        self.runner_marker = loc.pose_marker(ax, "tab:purple", "--")
+        self.verdict = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", fontsize=10,
+                               weight="bold", zorder=10,
+                               bbox=dict(facecolor="white", alpha=0.85, edgecolor="none"))
+        ax.legend(handles=handles + [
+            Line2D([], [], marker="o", ls="", color="tab:orange", label="new scan at initial guess (local)"),
+            Line2D([], [], marker="o", ls="", color="tab:blue", label="localised new scan + pose"),
+            Line2D([], [], marker="o", ls="", color="tab:purple", label="alternative pose (ambiguous)")],
+            loc="upper right", fontsize=8, framealpha=0.9)
+        self.canvas.mpl_connect("button_press_event", self.on_click)
+        self.prepare_plot(ax, compact=False)
+        self.figure.subplots_adjust(left=0.10, right=0.97, bottom=0.08, top=0.95)
+        self.reference_ready = True
+        self.change_search()
+
+    # -- target scan ------------------------------------------------------------
+    def choose_recorded(self):
+        if not self.reference_ready or self.busy:
+            return
+        path = filedialog.askopenfilename(parent=self.app.root, title="Load a separate recorded scan",
+                                          initialdir=common.SCANS_DIR, filetypes=[("LiDAR session JSON", "*.json")])
+        if path:
+            self.load_recorded(path)
+
+    def load_recorded(self, path):
+        try:
+            targets = loc.load_recorded_targets(path)
+        except (ValueError, part2.SessionError) as error:
+            self.set_info(str(error))
+            return False
+        self.targets, self.target_source = targets, Path(path).name
+        self.target_choice["values"] = [f"{t['id']} — {t['name']}" for t in targets]
+        self.target_choice.current(0)
+        return self.choose_target()
+
+    def choose_target(self, _=None):
+        if not self.reference_ready or not self.targets:
+            return False
+        target = self.targets[self.target_choice.current()]
+        return self.set_target(target["points_local"], f"{self.target_source}: {target['name']}")
+
+    def set_target(self, points, name):
+        points = np.array(points, dtype=float, copy=True)
+        if points.ndim != 2 or points.shape[1] != 2 or not len(points) or not np.all(np.isfinite(points)):
+            self.set_info("The new scan must contain finite local [x, y] points in metres.")
+            return False
+        signature = loc.measurement_signature(points)
+        duplicates = [s["id"] for s in self.model.scans
+                      if loc.measurement_signature(s["points_local"]) == signature]
+        if duplicates:  # its own points are in the reference: self-matching
+            self.set_info(f"These measurements already belong to reference scan(s) {duplicates}; "
+                          "localising them here would be self-matching. Use the leave-one-out "
+                          "evaluation (RUN_MODE = \"evaluation\" in Codes 05 and 06).")
+            return False
+        points.setflags(write=False)
+        self.target, self.result = (points, name), None
+        self.generation += 1
+        self.set_info(f"{name}\n{len(points)} original local points. Source pose ignored.\n"
+                      "Next: press Localise.")
+        self.redraw()
+        return True
+
+    def captured(self, points):
+        self.set_target(points, "Fresh LD06 capture")
+
+    def capture(self, done):
+        if self.reference_ready:
+            super().capture(done)
+
+    # -- search ------------------------------------------------------------------
+    def global_search(self):
+        return self.search.current() == 0
+
+    def change_search(self, _=None):
+        index = 0 if self.global_search() else 1
+        self.search_note.configure(text=self.SEARCH_NOTES[index])
+        if index:
+            self.local_controls.pack(fill="x", after=self.action_row)
+        else:
+            self.local_controls.pack_forget()
+        self.redraw()
+
+    def set_pose(self, pose):
+        self.guess = vloc.pose_from_day1(pose)
+        if self.result is not None and self.result.initial_pose is not None:
+            self.result = None  # that answer was for another guess
+        self.generation += 1
+        self.redraw()
+
+    def on_click(self, event):
+        toolbar = getattr(self.canvas, "toolbar", None)
+        if not self.reference_ready or self.global_search() or event.inaxes is not self.axes \
+                or event.xdata is None or (toolbar is not None and toolbar.mode):
+            return
+        x, y, theta = self.guess
+        if event.button == 1:
+            x, y = event.xdata, event.ydata
+        elif event.button == 3:
+            theta = np.arctan2(event.ydata - y, event.xdata - x)
+        self.set_pose(vloc.pose_to_day1((x, y, theta)))
+
+    def localise(self):
+        if not self.reference_ready or self.busy:
+            return
+        if self.target is None:
+            self.set_info("Capture or load a new scan first.")
+            return
+        points, generation = self.target[0], self.generation
+        initial = None if self.global_search() else self.guess
+        self.stop = stop = threading.Event()
+        self.progress = 0.0
+
+        def report(fraction):
+            self.progress = fraction  # read by tick() on the Tk thread
+
+        def done(result):
+            self.progress = self.shown_progress = None
+            if result.status == "cancelled":
+                self.set_info("Search cancelled. Nothing was changed.")
+                return
+            if generation != self.generation:
+                self.set_info("Target, guess or reference changed during the search. "
+                              "Press Localise again.")
+                return
+            self.result = result
+            self.app.last_runtime = f"{result.runtime_ms:.0f} ms ({self.REFERENCE_NAME})"
+            self.set_info(f"{result.status}: {result.reason}\n\n{RESULT_ADVICE.get(result.status, '')}")
+            self.redraw()
+
+        work = self.compute(points, initial, report, stop.is_set)
+        self.run(f"Localising on the {self.REFERENCE_NAME}…", work, done,
+                 controls=(self.localise_button,))
+
+    def cancel_search(self):
+        self.stop.set()
+
+    def tick(self):
+        if self.busy and self.progress is not None:
+            shown = int(self.progress * 20)
+            if shown != self.shown_progress:
+                self.shown_progress = shown
+                self.set_info(f"Localising on the {self.REFERENCE_NAME}… {shown * 5} %\n"
+                              "Cancel stops it; nothing is changed.")
+
+    def close(self):
+        self.stop.set()
+        super().close()
+
+    # -- drawing ----------------------------------------------------------------
+    def redraw(self):
+        if not self.reference_ready:
+            return
+        empty = np.empty((0, 2))
+        points = vloc.filter_ranges(self.target[0]) if self.target is not None else empty
+        local = not self.global_search()
+        self.initial_points.set_offsets(vloc.transform_points(points, self.guess)
+                                        if local and len(points) else empty)
+        loc.set_pose_marker(self.initial_marker, self.guess if local else None)
+        result = self.result
+        reliable = result is not None and result.status == "ok"
+        alpha = 1.0 if reliable else 0.3
+        if result is not None and result.pose is not None:
+            self.aligned_points.set_offsets(vloc.transform_points(points, result.pose))
+            loc.set_pose_marker(self.aligned_marker, result.pose)
+        else:
+            self.aligned_points.set_offsets(empty)
+            loc.set_pose_marker(self.aligned_marker, None)
+        self.aligned_points.set_alpha(alpha)
+        for artist in self.aligned_marker:
+            artist.set_alpha(alpha)
+        runner = result.details.get("runner_up_pose") if result is not None else None
+        if result is not None and result.status == "ambiguous" and runner is not None:
+            pose = vloc.pose_from_day1(runner)
+            self.runner_points.set_offsets(vloc.transform_points(points, pose))
+            loc.set_pose_marker(self.runner_marker, pose)
+        else:
+            self.runner_points.set_offsets(empty)
+            loc.set_pose_marker(self.runner_marker, None)
+        if result is None:
+            self.verdict.set_text("")
+        elif reliable:
+            self.verdict.set_text("Localised (status ok)")
+            self.verdict.set_color("#1B7F4B")
+        else:
+            self.verdict.set_text(f"NOT localised ({result.status}): faded pose is not an answer"
+                                  + ("; purple = equally good alternative"
+                                     if result.status == "ambiguous" and runner else ""))
+            self.verdict.set_color("#B3261E")
+        self.axes.set_title(self.target[1] if self.target is not None else
+                            f"{self.REFERENCE_NAME.capitalize()} · capture or load a scan",
+                            fontsize=10, color=TEXT)
+        self.result_label.configure(text=self.result_text())
+        self.pose.sync()
+        self.canvas.draw_idle()
+
+    def result_text(self):
+        result = self.result
+        if result is None:
+            return ("Press Localise." if self.target is not None
+                    else "Load a separate scan or capture one to begin.")
+        lines = [f"status: {result.status}",
+                 "search: " + ("global (no initial pose)" if result.initial_pose is None
+                               else "local (±1 m, ±30°)")]
+        if result.pose is not None:
+            x, y, heading = vloc.pose_to_day1(result.pose)
+            lines += [f"X {x:.3f} m   Y {y:.3f} m", f"heading {heading:.2f}°",
+                      f"score {result.score:.3f}"
+                      + (f" (best different pose {result.runner_up_score:.3f})"
+                         if result.runner_up_score is not None else "")]
+            lines += self.measure_lines(result)
+        lines += [f"time {result.runtime_ms:.0f} ms (algorithm only)",
+                  f"Reference {self.REFERENCE_NAME} stays fixed. No measured pose:",
+                  "this is a matching result, not physical accuracy."]
+        return "\n".join(lines)
+
+
+class VectorLocalisationPage(NewScanLocalisationPage):
+    """Code 05: a new scan on the Code 03 vector map (finite segments)."""
+    TITLE = "Vector Localisation"
+    DESCRIPTION = ("Code 05 · scan points matched to the finite segments of the "
+                   "Code 03 vector map (point-to-segment distance).")
+    REFERENCE_NAME = "vector map"
+    SEARCH_NOTES = (
+        "No initial pose needed: every plausible position in the mapped room and every "
+        "heading is searched against the vector segments. A few seconds; ambiguity is "
+        "reported.",
+        "Faster. Needs a guess within ±1 m and ±30°: left-click the position, right-click "
+        "toward the LiDAR front (+X).")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.vmap = None
+        self.set_info("Extracting vector map…")
+        app.derived(self, "vectors", build_vectors, self.vectors_ready)
+
+    def vectors_ready(self, data):
+        merged = data[3]
+        if not merged:
+            self.set_info("The vector map has no segments: nothing to localise against.")
+            return
+        cached = self.model.cache.get("vector_reference")
+        if cached is not None:
+            self.ready(cached)
+            return
+        revision = self.model.revision
+
+        def keep(vmap):
+            if revision == self.model.revision:
+                self.model.cache["vector_reference"] = vmap
+            self.ready(vmap)
+        self.run("Preparing vector reference…", lambda: vloc.VectorMap.from_merged(merged), keep)
+
+    def ready(self, vmap):
+        self.vmap = vmap
+        self.setup_plot()
+        self.set_info(f"Vector map ready: {len(vmap.starts)} segments. Load a separate scan "
+                      "or capture a fresh one.")
+
+    def draw_reference(self, ax):
+        vmap = self.vmap
+        ax.add_collection(LineCollection(np.stack([vmap.starts, vmap.ends], axis=1),
+                                         colors="#16232F", linewidths=2.2, zorder=2))
+        left, right, bottom, top = vmap.segment_extent
+        return ([Line2D([], [], color="#16232F", lw=2.2,
+                        label=f"vector map ({len(vmap.starts)} segments)")],
+                ((left - 0.5, right + 0.5), (bottom - 0.5, top + 0.5)))
+
+    def compute(self, points, initial, report, should_stop):
+        vmap = self.vmap
+        return lambda: vloc.localise_vector(vmap, points, initial, progress=report,
+                                            should_stop=should_stop)
+
+    def measure_lines(self, result):
+        d = result.details
+        return [f"{d['inliers']:.0%} of points within 8 cm of a segment",
+                f"RMS {d['rms_m'] * 100:.1f} cm · {d['segments']} supporting segments",
+                f"constraint {d['constraint']:.2f} (walls in two directions)"]
+
+
+class ScanLocalisationPage(NewScanLocalisationPage):
+    """Code 06: a new scan matched to recorded LiDAR points (Code 01 + ICP)."""
+    TITLE = "Scan Localisation"
+    DESCRIPTION = ("Code 06 · new scan matched to previously recorded LiDAR POINTS with "
+                   "Code 01's correlative search + ICP. No grid, no vector map.")
+    REFERENCE_NAME = "reference scans"
+    REFERENCE_MODES = ("Single scan (strict scan-to-scan)",
+                       "Accumulated scans (point cloud of all scans)")
+    SEARCH_NOTES = (
+        "No initial pose needed: every position in the reference's area and every heading "
+        "(2°) is searched, 10 distinct candidates refined by ICP. Single scan: a few "
+        "seconds; accumulated: up to ~10 s.",
+        "Faster. Searches ±1 m and ±30° around the guess (20 cm, 2° steps), then ICP: "
+        "left-click the position, right-click toward the LiDAR front (+X).")
+
+    def reference_controls(self, parent):
+        section(parent, "Reference")
+        self.reference_mode = ttk.Combobox(parent, state="readonly", values=self.REFERENCE_MODES)
+        self.reference_mode.set(self.REFERENCE_MODES[0])
+        self.reference_mode.pack(fill="x", pady=4)
+        self.reference_mode.bind("<<ComboboxSelected>>", self.change_reference)
+        self.reference_choice = ttk.Combobox(parent, state="readonly")
+        self.reference_choice.pack(fill="x", pady=4)
+        self.reference_choice.bind("<<ComboboxSelected>>", self.change_reference)
+        self.reference_note = note(parent, "")
+
+    def __init__(self, app):
+        super().__init__(app)
+        scans = self.model.scans
+        self.reference_choice["values"] = [f"Scan {s['id']} — pose ({s['pose'][0]:.2f}, "
+                                           f"{s['pose'][1]:.2f}, {s['pose'][2]:.0f}°)" for s in scans]
+        if not scans:
+            self.set_info("No visible positioned scans: open a session or show scans in "
+                          "LiDAR Scanner.")
+            return
+        self.reference_choice.current(0)
+        self.setup_plot()
+        self.change_reference()
+        self.set_info(f"Reference ready: {len(scans)} positioned scans. Load a separate scan or "
+                      "capture a fresh one.")
+
+    def single(self):
+        return self.reference_mode.current() == 0
+
+    def references(self):
+        """Code 06 reference for the current choice (copied, never modified)."""
+        scans = self.model.scans
+        if self.single():
+            return sloc.reference_scans(scans, "single",
+                                        scans[self.reference_choice.current()]["id"])
+        return sloc.reference_scans(scans, "accumulated")
+
+    def change_reference(self, _=None):
+        if self.single():
+            self.reference_choice.pack(fill="x", pady=4, before=self.reference_note)
+            self.reference_note.configure(
+                text="Strict scan-to-scan: the new scan is matched to ONE recorded scan, "
+                     "placed in the Scan 1 frame by its saved pose. Little overlap = failure.")
+        else:
+            self.reference_choice.pack_forget()
+            self.reference_note.configure(
+                text=f"Scan-to-accumulated-point-cloud: all {len(self.model.scans)} positioned "
+                     "scans pooled (as Code 01's Auto Align reference).")
+        if self.reference_ready:
+            self.generation += 1
+            self.result = None
+            self.draw_reference_points()
+            self.redraw()
+
+    def draw_reference(self, ax):
+        self.reference_points = ax.scatter(np.empty(0), np.empty(0), s=2, color="0.45", zorder=2)
+        self.reference_poses = ax.scatter(np.empty(0), np.empty(0), s=36, marker="s",
+                                          color="0.25", zorder=5)
+        everything = np.vstack([vloc.transform_points(s["points_local"],
+                                                      vloc.pose_from_day1(s["pose"]))
+                                for s in self.model.scans])
+        everything = everything[np.all(np.isfinite(everything), axis=1)]
+        low, high = everything.min(axis=0) - 0.5, everything.max(axis=0) + 0.5
+        return ([Line2D([], [], marker="o", ls="", color="0.45", label="reference LiDAR points"),
+                 Line2D([], [], marker="s", ls="", color="0.25", label="reference scan pose(s)")],
+                ((low[0], high[0]), (low[1], high[1])))
+
+    def draw_reference_points(self):
+        references = self.references()
+        points = np.vstack([part1.transform_points(local, pose) for local, pose in references])
+        self.reference_points.set_offsets(points)
+        self.reference_poses.set_offsets(np.array([pose[:2] for _, pose in references]))
+
+    def compute(self, points, initial, report, should_stop):
+        references = self.references()
+        mode = "single" if self.single() else "accumulated"
+        return lambda: sloc.localise_on_scans(points, references, initial, progress=report,
+                                              should_stop=should_stop, mode=mode)
+
+    def measure_lines(self, result):
+        d = result.details
+        reference = ("single scan" if d["mode"] == "single"
+                     else f"{d['reference_scans']} scans accumulated")
+        return [f"matched {d['match_fraction']:.0%} (within 8 cm) · RMS {d['rms_m'] * 100:.1f} cm",
+                f"see-through {d['conflict']:.0%} (scan past reference "
+                f"{d['scan_sees_through']:.0%}, reference through scan "
+                f"{d['reference_sees_through']:.0%})",
+                f"reference: {reference} · Code 01 verdict: {d['code01_status']}"]
+
+
 BUILD_LABELS = {"grid": "Building occupancy grid…", "vectors": "Extracting vector map…"}
 
 # Add future pages here when their algorithms are implemented.
 PAGES = {"LiDAR Scanner": ScannerPage, "Grid Mapping": GridPage,
-         "Vector Mapping": VectorPage, "Grid Localisation": LocalisationPage}
+         "Vector Mapping": VectorPage, "Grid Localisation": LocalisationPage,
+         "Vector Localisation": VectorLocalisationPage,
+         "Scan Localisation": ScanLocalisationPage}
 
 
 class DesktopApp:

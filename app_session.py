@@ -12,6 +12,8 @@ part1 = common.day1("part1")
 part2 = common.day1("part2")
 part3 = common.day1("part3")
 grid_localisation = importlib.import_module("04_grid_localisation")
+vector_localisation = importlib.import_module("05_vector_localisation")
+scan_localisation = importlib.import_module("06_scan_localisation")
 
 
 def session_digest(session):
@@ -109,7 +111,10 @@ def build_vectors(scans):
 
 
 class CaptureAdapter:
-    """One bounded capture via Code 01's existing ESP32/LD06 Teleplot reader.
+    """One bounded capture via Code 01's existing ESP32/LD06 serial reader.
+
+    Accepts both library formats (Teleplot XY and CSV); `state` names the
+    format arriving, so the status bar shows it during and after a capture.
 
     Called on a background thread. That thread alone owns the connection;
     cancel/close only set an Event. No bytes or reset commands are transmitted.
@@ -119,6 +124,7 @@ class CaptureAdapter:
         self.lock = threading.Lock()
         self.active = False
         self.state = "Port closed (not probed)"
+        self.last_format = None
 
     def cancel(self):
         self.stop.set()
@@ -135,13 +141,20 @@ class CaptureAdapter:
             connection = part1.open_serial_readonly(port, baudrate)
             self.state = f"Reading {port}"
             connection.reset_input_buffer()
+
+            def show_format(fmt):
+                self.last_format = fmt
+                self.state = f"Reading {port} · {part1.FORMAT_LABELS[fmt]}"
             scans, report = part1.capture_teleplot_scans(
-                connection, 1, timeout_s, stop_event=self.stop)
+                connection, 1, timeout_s, stop_event=self.stop,
+                on_format=show_format)
             part1.print_capture_report(scans, report, 1)
             if not scans or self.stop.is_set():
                 raise RuntimeError(
-                    f"No scan captured ({report['stop_reason']}). Check USB, COM port, "
-                    "baud rate and the ESP32 Teleplot firmware. Close other serial monitors.")
+                    f"No scan captured ({report['stop_reason']}; serial format: "
+                    f"{part1.FORMAT_LABELS[report['format']]}). Check USB, COM port, "
+                    "baud rate and that the ESP32 prints Teleplot or CSV scans. "
+                    "Close other serial monitors.")
             return np.column_stack(part1.teleplot_to_sensor_frame(*scans[0]))
         except part1.serial.SerialException as error:
             raise RuntimeError(f"Cannot read {port}: {error}. Check USB and port; "
@@ -151,6 +164,7 @@ class CaptureAdapter:
                 if connection is not None:
                     connection.close()
             finally:
-                self.state = "Port closed"
+                self.state = ("Port closed" if self.last_format is None else
+                              f"Port closed · last format: {part1.FORMAT_LABELS[self.last_format]}")
                 self.active = False
                 self.lock.release()
