@@ -26,7 +26,7 @@ their probability) and 4 (impact cell: occupied, or raise its probability).
 Automated tests, from the project folder:
     python -m unittest 02_grid_mapping -v
 """
-
+import argparse
 import contextlib
 import hashlib
 import io
@@ -43,7 +43,6 @@ from unittest import mock
 
 import matplotlib.pyplot as plt
 import numpy as np
-
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -57,8 +56,21 @@ import numpy as np
 # The file is only ever READ. Any number of scans is accepted.
 SESSION_FILE = "classroom_final.json"
 SCANS_DIR = Path(__file__).resolve().parent / "scans"
-CELL_SIZE_M = 0.10       # resolution: each cell is a 10 cm x 10 cm square
-GRID_MARGIN_M = 0.50     # empty border around the measured area
+
+def choose_scan_file():
+    from tkinter import Tk, filedialog
+    root = Tk()
+    root.withdraw()
+    try:
+        filename = filedialog.askopenfilename(
+            parent=root, title="Select LiDAR Scan File",
+            initialdir=str(SCANS_DIR), filetypes=[("JSON Files", "*.json")])
+    finally:
+        root.destroy()
+    return Path(filename) if filename else None
+
+CELL_SIZE_M = 0.10
+GRID_MARGIN_M = 0.50
 # None = automatic: the grid holds every point and pose (+ margin).
 # Or fix it by hand, e.g. (-6.5, -3.0, 5.0, 11.5) = (x_min, y_min, x_max,
 # y_max) in metres to keep only the classroom; points outside are counted.
@@ -651,7 +663,8 @@ PROBABILITY_COLORBAR_LABELS = ("p = 0 (free)", "p = 0.5 (unknown)",
 
 
 def show_grid(grid, spec, scans=None, global_point_arrays=None, title="",
-              show_points=True, colorbar_labels=BINARY_COLORBAR_LABELS):
+              show_points=True, colorbar_labels=BINARY_COLORBAR_LABELS,
+              figure=None):
     """Draw the grid as an image (and optionally the scans on top).
 
     Colour = cell value: 0 (free) white, 127 (unknown) grey, 255 (occupied)
@@ -664,7 +677,10 @@ def show_grid(grid, spec, scans=None, global_point_arrays=None, title="",
     with probabilities_to_uint8() (same grey scale; other colour-bar text).
     Returns the figure.
     """
-    figure, axes = plt.subplots(figsize=(11, 8))
+    if figure is None:
+        figure, axes = plt.subplots(figsize=(11, 8))
+    else:
+        axes = figure.add_subplot(111)
     image = axes.imshow(grid, cmap="gray_r", vmin=FREE, vmax=OCCUPIED,
                         origin="lower", extent=grid_extent(spec),
                         interpolation="nearest")
@@ -1665,13 +1681,32 @@ class SessionSelectionTests(unittest.TestCase):
         # What PyCharm does: start the file as a program. Here from an
         # unrelated working folder, with an off-screen Matplotlib backend.
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve())],
+            [sys.executable, str(Path(__file__).resolve()), "--non-interactive"],
             cwd=self.folder.name, capture_output=True, text=True,
             env=dict(os.environ, MPLBACKEND="Agg"), timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("16 scans", result.stdout)
         self.assertIn("Session file unchanged: True", result.stdout)
 
+def cli(argv=None):
+    global SESSION_FILE
+    parser = argparse.ArgumentParser(description="Occupancy grid mapping")
+    parser.add_argument("--session", type=Path, help="Session JSON; skips the picker")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="No picker or plot window; use --session or the default session")
+    args = parser.parse_args(argv)
+    selected = args.session or (resolve_session_path(SESSION_FILE) if args.non_interactive
+                                else choose_scan_file())
+    if selected is None:
+        print("No file selected.")
+        return
+    SESSION_FILE = str(selected)
+    if args.non_interactive:
+        plt.switch_backend("Agg")
+    main()
+    if args.non_interactive:
+        plt.close("all")
+
 
 if __name__ == "__main__":
-    main()
+    cli()

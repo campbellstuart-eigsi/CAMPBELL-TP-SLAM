@@ -2178,7 +2178,7 @@ def format_alignment_report(scan, proposal):
 
 
 def create_session_editor(session, worker=None, start_message="",
-                          file_name=DEFAULT_SESSION_FILE):
+                          file_name=DEFAULT_SESSION_FILE, figure=None):
     """Open the mapping window and return (figure, controls).
 
     session   - a session dictionary (create_session()); the window edits it
@@ -2189,7 +2189,9 @@ def create_session_editor(session, worker=None, start_message="",
     responding if Python deletes them. controls["actions"] also lets the
     tests press the buttons without a mouse.
     """
-    figure = plt.figure(figsize=(13, 8))
+    # A host may supply a Figure with its canvas already attached. This keeps
+    # widget callbacks and the polling timer on the host's single event loop.
+    figure = figure if figure is not None else plt.figure(figsize=(13, 8))
     map_axes = figure.add_axes([0.32, 0.25, 0.66, 0.71])
     # syncing: True while the program itself moves the sliders, so their
     # callbacks do not treat it as a user action.
@@ -2822,6 +2824,7 @@ def create_session_editor(session, worker=None, start_message="",
     timer = figure.canvas.new_timer(interval=100)
     timer.add_callback(poll_background)
     timer.start()
+    figure.canvas.mpl_connect("close_event", lambda _event: timer.stop())
 
     select_scan(session["selected_id"])
     fit_view()
@@ -2829,6 +2832,7 @@ def create_session_editor(session, worker=None, start_message="",
                                   "sliders.")
 
     controls = {
+        "axes": map_axes,
         "sliders": pose_sliders, "opacity_slider": opacity_slider,
         "display_selector": display_selector, "file_box": file_box,
         "timer": timer,

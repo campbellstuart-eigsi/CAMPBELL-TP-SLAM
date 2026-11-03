@@ -45,7 +45,7 @@ from Part 2 (02_grid_mapping.py, unchanged).
 Automated tests, from the project folder:
     python -m unittest 03_vector_mapping -v
 """
-
+import argparse
 import contextlib
 import hashlib
 import importlib
@@ -68,6 +68,7 @@ from matplotlib.widgets import Button, CheckButtons
 import matplotlib.pyplot as plt
 import numpy as np
 
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -82,6 +83,21 @@ SESSION_FILE = "classroom_final.json"
 PROJECT_DIR = Path(__file__).resolve().parent
 SCANS_DIR = PROJECT_DIR / "scans"
 
+def choose_scan_file():
+    from tkinter import Tk, filedialog
+    root = Tk()
+    root.withdraw()
+
+    try:
+        filename = filedialog.askopenfilename(
+            title="Select LiDAR Scan File — Vector Mapping",
+            initialdir=str(SCANS_DIR),
+            filetypes=[("JSON Files", "*.json")]
+        )
+    finally:
+        root.destroy()
+
+    return Path(filename) if filename else None
 # What to display:
 #   "points"   - milestone 1: the global point cloud (colours: see below)
 #   "clusters" - milestone 2: each accepted cluster in its own colour
@@ -1374,7 +1390,7 @@ def layer_home_limits(scans, margin_fraction=0.04):
 
 def build_layer_viewer(scans, clusters, records, merged,
                        visible_at_start=LAYERS_VISIBLE_AT_START,
-                       inspection_style=INSPECTION_STYLE):
+                       inspection_style=INSPECTION_STYLE, figure=None):
     """Open the map with one tick box per layer; return the viewer.
 
     The returned dictionary keeps the widgets alive (Matplotlib widgets stop
@@ -1384,7 +1400,7 @@ def build_layer_viewer(scans, clusters, records, merged,
         "set_layer(key, visible)", "show_all()", "hide_all()",
         "reset_view()", "visible_layers()"
     """
-    figure = plt.figure(figsize=(13, 8))
+    figure = figure if figure is not None else plt.figure(figsize=(13, 8))
     axes = figure.add_axes([0.05, 0.06, 0.66, 0.88])
     palette = plt.get_cmap("tab20")
     layers = {key: [] for key in LAYER_KEYS}
@@ -1907,7 +1923,7 @@ class ClassroomTests(Part3TestCase):
         # with an off-screen Matplotlib backend (no window opens).
         before = file_sha256(CLASSROOM_FINAL)
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve())],
+            [sys.executable, str(Path(__file__).resolve()), "--non-interactive"],
             cwd=self.folder.name, capture_output=True, text=True,
             env=dict(os.environ, MPLBACKEND="Agg"), timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2459,7 +2475,7 @@ class ClassroomLineTests(Part3TestCase):
 
     def test_script_prints_the_segment_summary(self):
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve())],
+            [sys.executable, str(Path(__file__).resolve()), "--non-interactive"],
             cwd=self.folder.name, capture_output=True, text=True,
             env=dict(os.environ, MPLBACKEND="Agg"), timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -3239,5 +3255,25 @@ class TraceabilityTests(Part3TestCase):
         self.assertEqual(file_sha256(CLASSROOM_FINAL), before)
 
 
-if __name__ == "__main__":
+def cli(argv=None):
+    global SESSION_FILE
+    parser = argparse.ArgumentParser(description="Vector mapping")
+    parser.add_argument("--session", type=Path, help="Session JSON; skips the picker")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="No picker or plot window; use --session or the default session")
+    args = parser.parse_args(argv)
+    selected = args.session or (resolve_session_path(SESSION_FILE) if args.non_interactive
+                                else choose_scan_file())
+    if selected is None:
+        print("No file selected.")
+        return
+    SESSION_FILE = str(selected)
+    if args.non_interactive:
+        plt.switch_backend("Agg")
     main()
+    if args.non_interactive:
+        plt.close("all")
+
+
+if __name__ == "__main__":
+    cli()
