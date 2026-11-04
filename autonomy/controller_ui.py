@@ -1,4 +1,4 @@
-"""Robot controller panel: manual Wi-Fi driving, ARM/STOP, status and a LiDAR preview.
+"""Robot controller panel: connect, drive with the keyboard, stop; status and a LiDAR preview.
 
 RobotControllerPanel is a ttk.Frame styled with the SLAM application's
 ui_theme, so a Workspace page can host it later; robot_controller.py opens it
@@ -6,12 +6,13 @@ in its own window. All networking is in autonomy.teleop (worker threads);
 this Tk side only calls its non-blocking methods and redraws from
 Teleop.snapshot() every POLL_MS.
 
+Use: Connect, hold a movement key to drive (the first press arms the robot;
+the firmware may refuse and says why), release to stop, Space or Esc = STOP.
+
 Modes:
-  SIMULATOR   (default) a FakeHttpRobot in a simulated room on 127.0.0.1;
-              no hardware. Its fault buttons exercise the safety paths.
-  REAL ROBOT  the ESP32SlamRobot firmware (default http://192.168.4.1). ARM
-              stays refused until the bench safety checks are ticked for the
-              current connection.
+  REAL ROBOT  (default) the ESP32SlamRobot firmware (http://192.168.4.1)
+  SIMULATOR   a FakeHttpRobot in a simulated room on 127.0.0.1; no hardware.
+              Its fault buttons exercise the safety paths.
 Launching never connects or arms anything.
 """
 import tkinter as tk
@@ -33,9 +34,6 @@ RAIL_W = 340
 PREVIEW_RANGE_M = 4.0
 KEY_NAMES = {"space": "Space"}
 PAD = [("rotate_left", "forward", "rotate_right"), ("left", "backward", "right")]
-SAFETY_CHECKS = ("Wheels raised, all four free of contact",
-                 "Motor power cut-off within reach",
-                 "Firmware is the S0 build (boots DISARMED)")
 
 
 def key_name(keysym):
@@ -49,11 +47,11 @@ class RobotControllerPanel(ttk.Frame):
         self.teleop = teleop or Teleop()
         self.fake = None
         self.layout_name = tk.StringVar(value=DEFAULT_LAYOUT)
-        self.mode = tk.StringVar(value="sim")
+        self.mode = tk.StringVar(value="real")
+        self.teleop.set_mode(True)
         self.url = tk.StringVar(value=DEFAULT_URL)
         self.drive_pct = tk.IntVar(value=self.teleop.drive_pct)
         self.turn_pct = tk.IntVar(value=self.teleop.turn_pct)
-        self.checks = [tk.BooleanVar(value=False) for _ in SAFETY_CHECKS]
         self.fault_vars = {name: tk.BooleanVar(value=False)
                            for name in ("lidar_off", "silent", "stuck")}
         self.keyboard_active = False
@@ -151,21 +149,6 @@ class RobotControllerPanel(ttk.Frame):
                                             command=self.teleop.request_disconnect)
         self.disconnect_button.pack(side="left", fill="x", expand=True)
 
-        self.safety_body = self._section(rail, "Bench safety (real robot)")
-        for text, var in zip(SAFETY_CHECKS, self.checks):
-            ttk.Checkbutton(self.safety_body, text=text, variable=var,
-                            command=self._safety_changed).pack(anchor="w")
-
-        body = self._section(rail, "Arm")
-        self.arm_section = body.master
-        row = ttk.Frame(body)
-        row.pack(fill="x")
-        self.arm_button = ttk.Button(row, text="ARM", style="Primary.TButton",
-                                     command=self.teleop.request_arm)
-        self.arm_button.pack(side="left", fill="x", expand=True, padx=(0, 2))
-        self.disarm_button = ttk.Button(row, text="DISARM", command=self.teleop.request_disarm)
-        self.disarm_button.pack(side="left", fill="x", expand=True)
-
         body = self._section(rail, "Drive")
         row = ttk.Frame(body)
         row.pack(fill="x")
@@ -204,7 +187,8 @@ class RobotControllerPanel(ttk.Frame):
 
         body = self._section(rail, "Status")
         self.status_values = {}
-        for name in ("Link", "Firmware", "LiDAR", "Command", "Reply"):
+        for name in ("Link", "Firmware", "LiDAR", "I²C", "Motors", "Last stop", "Refused",
+                     "Command", "Reply"):
             row = ttk.Frame(body)
             row.pack(fill="x")
             ttk.Label(row, text=name, style="Field.TLabel", width=9).pack(side="left")
@@ -311,8 +295,6 @@ class RobotControllerPanel(ttk.Frame):
     def _set_mode(self, value):
         if self.teleop.set_mode(value == "real"):
             self.mode.set(value)
-            for var in self.checks:
-                var.set(False)
 
     def _connect(self):
         if self.mode.get() == "sim":
@@ -322,9 +304,6 @@ class RobotControllerPanel(ttk.Frame):
         else:
             self.teleop.request_connect(self.url.get().strip())
         self.focus_set()
-
-    def _safety_changed(self):
-        self.teleop.set_safety_ack(all(var.get() for var in self.checks))
 
     def _speeds_changed(self, var, label):
         var.set(int(round(float(var.get()))))
@@ -366,27 +345,22 @@ class RobotControllerPanel(ttk.Frame):
             # Hidden sections are unpacked, then re-packed next to a fixed neighbour.
             if real:
                 self.sim_body.master.pack_forget()
-                self.safety_body.master.pack(fill="x", before=self.arm_section)
                 self.url_row.pack(fill="x", before=self.connect_row)
             else:
-                self.safety_body.master.pack_forget()
                 self.url_row.pack_forget()
                 self.sim_body.master.pack(fill="x", after=self.status_section)
         self.url_entry.configure(state="disabled" if connected else "normal")
-        self.connect_button.configure(state="normal" if not connected and idle else "disabled")
+        self.connect_button.configure(state="normal" if not connected and not snap.busy
+                                      else "disabled")
         self.disconnect_button.configure(state="normal" if connected and idle else "disabled")
-        can_arm = snap.link == "ok" and idle and (snap.safety_ack or not real)
-        self.arm_button.configure(state="normal" if can_arm else "disabled")
-        self.disarm_button.configure(state="normal" if connected and idle else "disabled")
         held = set(snap.held) if snap.armed else set()
         for action, label in self.key_labels.items():
             label.configure(style="KeyOn.TLabel" if action in held else "Key.TLabel")
         self.keyboard_label.configure(
             text="keys active" if self.keyboard_active else "click here to drive")
         self.calibration_note.configure(
-            text="Manual PWM % only (no distance calibration needed). Distance moves stay "
-                 "blocked until calibrated." if not snap.calibrated
-            else "Calibrated: distance moves allowed.")
+            text="Hold a key to drive, release to stop. Space or Esc = STOP. Speeds are raw "
+                 "PWM %: distance moves stay blocked until calibrated.")
         self._refresh_status(snap)
         self._refresh_scan(snap)
         lines = [f"{when}  {text}" for when, text in snap.errors[-5:]]
@@ -401,24 +375,46 @@ class RobotControllerPanel(ttk.Frame):
         self._set_value("Link", f"{snap.link}{busy}", link_level)
         status = snap.status
         if status is None:
-            self._set_value("Firmware", "—")
-            self._set_value("LiDAR", "—")
+            for name in ("Firmware", "LiDAR", "I²C", "Motors", "Last stop", "Refused"):
+                self._set_value(name, "—")
         else:
             if status["fault"]:
                 text, level = "FAULT", "Bad"
             elif snap.armed:
                 text, level = ("ARMED, moving" if status["moving"] else "ARMED"), "Warn"
+            elif status.get("motors_locked"):
+                text, level = "MOTORS LOCKED build", "Warn"
             else:
                 text, level = "DISARMED", "Good"
-            self._set_value("Firmware", f"{text}  · boot {status['boot_id']:08X}", level)
+            self._set_value("Firmware", f"{text} · {status['boot_id']:08X}", level)
             age = status.get("scan_age_ms", 0)
             level = "Good" if age < 500 else "Bad"
             self._set_value("LiDAR", f"{status.get('scan_points', 0)} pts · "
                                      f"{age} ms · {status.get('lidar_dps', 0)}°/s", level)
+            self._refresh_motor_diagnostics(status)
         vx, vy, wz = snap.command
-        state = "STOP latched" if snap.stop_latched else f"vx {vx:+d} vy {vy:+d} wz {wz:+d} %"
+        state = ("stopped · press a key to drive" if snap.stop_latched
+                 else f"vx {vx:+d} vy {vy:+d} wz {wz:+d} %")
         self._set_value("Command", state, "Warn" if snap.command != (0, 0, 0) else "Mono")
         self._set_value("Reply", f"{snap.last_reply or '—'}  · {snap.drives_sent} sent")
+
+    def _refresh_motor_diagnostics(self, status):
+        """The firmware's own motor and command diagnostics (absent on older builds)."""
+        if "i2c_ack_0x30" not in status:
+            self._set_value("I²C", "— (older firmware)")
+            for name in ("Motors", "Last stop", "Refused"):
+                self._set_value(name, "—")
+            return
+        ack = status["i2c_ack_0x30"] and not status.get("i2c_ack_0x31")
+        pwm = status.get("pwm", [0, 0, 0, 0])
+        self._set_value("I²C", f"0x30 {'ACK' if ack else 'NO ACK'} · {status.get('i2c_nacks', 0)}"
+                               f" NACK", "Good" if ack else "Bad")
+        self._set_value("Motors", f"PWM {' '.join(f'{v:+d}' for v in pwm)}",
+                        "Warn" if any(pwm) else "Mono")
+        self._set_value("Last stop", status.get("last_stop", "—"))
+        rejects = status.get("rejects", 0)
+        self._set_value("Refused", f"{status.get('last_reject', 'none')} · {rejects} since boot",
+                        "Warn" if rejects else "Mono")
 
     def _refresh_scan(self, snap):
         if snap.scan_seq == self.drawn_scan:

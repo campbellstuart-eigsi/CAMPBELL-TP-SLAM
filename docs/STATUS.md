@@ -1,97 +1,72 @@
 # Project status
 
-_Last updated: 2026-11-04_ · _Branch `feature/http-robot-mvp` (from b48037a), worktree `C:\Users\stuar\Desktop\SLAM-autonomy`_
+_Last updated: 2026-11-04_ · _Branch `feature/http-robot-mvp`, worktree `C:\Users\stuar\Desktop\SLAM-autonomy`_
 
 Current project state only. Keep under ~60 lines; replace outdated items rather than appending.
-The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP change).
+The fuller briefing is `docs/SESSION_HANDOFF.md`.
 
 ## Progress
-- **Approach B (MVP) approved:** the robot runs the HTTP firmware `firmware/ESP32SlamRobot/`;
-  Python drives it with `autonomy/http_robot_link.py`. Decision
-  `docs/decisions/2026-11-04_mvp_http_firmware.md`. Gates: S0 desk → S1 bench → S2 manual
-  driving + calibration → S3 drive-stop-scan-localise → S4 frontier exploration → S5 Workspace.
-- **S0 (desk) committed in 6cbefa9:** sketch fixes, `HttpRobotLink`, fake robot, 17 tests.
-- **Committed in 221c778:** robot controller GUI (`robot_controller.py`), teleop core, upload
-  package, `/arm` keeps the command seq.
-- **S1 (2026-11-04, user):** upload OK, then a reboot loop (`rst:0xc SW_CPU_RESET`), the AP
-  never appeared, and one wheel spun before and after the upload. Controller not connected.
-- **After S1 (uncommitted, awaiting review): diagnostic firmware** (COMPILE-VERIFIED /
-  HARDWARE-UNTESTED). Investigation: `docs/research/2026-11-04_s1_reboot_investigation.md`.
-  - Likely cause (code evidence, unconfirmed): the sketch shortened the shared task watchdog to
-    1 s, but AsyncTCP's task sleeps up to 1.25 s between resets. Brownout is the alternative;
-    the serial log decides.
-  - Fix: the core's 5 s shared watchdog, plus a 300 ms motor-task stall check. `[BOOT]`
-    checkpoints, reset reason, reset-loop count, motor I²C ACK at boot. `MOTORS_LOCKED 1`:
-    `/arm` refused.
-  - `test_firmware_static.py` (6 checks; fails on 221c778 as intended).
-- **Diagnostic firmware committed and pushed: 275782b** (`origin/feature/http-robot-mvp`).
-- **Headless live localisation (uncommitted, awaiting review):**
-  - `autonomy/live_localisation.py`: `LiveTracker` (Code 04 global search to start or recover;
-    local search seeded with the last accepted pose; lost after 3 local failures; only
-    ok/weak give a pose; stale scans skipped; the map is never modified).
-  - `autonomy/localisation_sim.py`: Part 1 classroom route and report.
-  - `test_autonomy_live_localisation.py`: 9 tests.
-  - Full route, 240 scans: 240 ok (1 global); position error median 4.9 cm, max 5.8 cm (the
-    fixture map's known half-cell bias). On Code 04's control map: max 4.9 mm. Heading max
-    0.58°; median 264 ms per scan.
-  - All errors are against **simulated** truth, not real accuracy.
-- **Hardware facts:** the I²C motor controller type is confirmed (user, from the professor).
-  Address 0x30, GPIO19/21 and the register map come from the library code only, **not
-  checked on the robot**.
-- **Phase B approach A preserved:** steps 1-2c in 364982a on `feature/autonomy-simulator`
-  (protocol v2, firmware model, `ProtocolRobotLink`, simulated Wi-Fi). Step 3 is parked:
-  untracked, uncompiled `firmware/autonomy_robot/src/crc.*` and `protocol.*` (v2). The old v1
-  draft is backed up in the session scratchpad only.
-- **Base:** Codes 01-06, the desktop app and the Workspace are unchanged here. M1 Stage 3
-  continues on `feature/ui-redesign` (`C:\Users\stuar\Desktop\SLAM`).
+- **Approach B (HTTP MVP):** ESP32 firmware `firmware/ESP32SlamRobot/` plus a Python controller
+  (`robot_controller.py`). Decisions: `docs/decisions/2026-11-04_mvp_http_firmware.md`,
+  `2026-11-04_simplified_controller_auto_arm.md`.
+- **Pushed to `origin/feature/http-robot-mvp`:**
+  - 6cbefa9: S0 firmware and `HttpRobotLink`;
+  - 221c778: controller and upload package;
+  - 275782b: diagnostic firmware after the S1 reboot loop;
+  - 2cdd3e3: headless live-localisation tracker.
+- **At the robot (user-reported):** S1 reboot loop, then (with the diagnostic build) Wi-Fi works.
+  The controller has not moved the robot.
+- **Uncommitted:**
+  - Firmware motor diagnostics: I²C ACK read with a pull-up; write-free 0x30/0x31 probe;
+    `/status` and serial report refusals, move ends, applied PWM and I²C counters.
+    `MOTORS_LOCKED 1`.
+  - Simplified controller: connect, drive, stop. No ARM/DISARM buttons; automatic arming on the
+    first key press; REAL ROBOT by default.
+  - The controller shows the firmware's exact refusal reasons.
 
 ## Next steps
-1. Your review of the headless tracker; a commit only with your approval.
-2. Next (proposed): tracking on the real classroom map (`classroom_final.json`) with scans
-   simulated from its vector map; then the Live Localisation workspace (four panels, worker
-   thread, simulator); then Live Exploration.
-3. At the robot: S1a with the diagnostic build (README section 7); S1b only after the cut-off
-   and reset checks pass.
+1. Your review; commit and push only with your approval.
+2. At the robot, still locked:
+   - boot log and `[I2C] VERDICT`;
+   - `/status` (`i2c_ack_0x30`, `i2c_nacks`, `scan_age_ms`);
+   - the controller shows `cannot drive: MOTORS_LOCKED`.
+
+   Firmware README section 7 (S1a-motor).
+3. Physical gate, then `MOTORS_LOCKED 0` and S1b (wheels in the air).
+4. Software: tracker on the real classroom map, then the Live Localisation workspace.
 
 ## Issues and safety blockers
 - **Blocks all movement:**
-  - a wheel spun at S1 without any command from this firmware (cause unknown);
-  - whether the controller holds PWM across ESP32 resets is unknown;
-  - a physical motor cut-off must be verified first.
+  - an S1 wheel spun with no command from this firmware;
+  - whether the I²C controller holds PWM across ESP32 resets is unknown;
+  - the motor-power cut-off is unverified.
 
   Code cannot prove that motor power is off.
-- **No encoders:** `move()` refuses until a `Calibration` measured at S2 is given.
-- **Late HTTP:** a `/drive` delayed in TCP can still start a lease late (300 ms from the
-  controller, at most 1 s from the firmware); after STOP it is refused (DISARMED, or STALE after
-  a re-ARM). The legacy course routes (`/forward` … , seq 0) bypass the seq check.
-- **Open access point:** anyone joined can drive (CORS `*`); the sketch refuses the example password.
-- **Never flash `ESP32MecanumCar.ino`:** it drives the motors for 5 s after boot.
-- **LD06 library licence unconfirmed:** the `ld06.*` files stay out of Git (`.gitignore`).
-- **Firmware libraries** (Async TCP 3.5.0, ESP Async WebServer 3.12.1, MecanumCar_v2) are only in
-  the scratchpad here; the flashing PC needs them installed (`DEPENDENCIES.md`).
-- **From M1:** GUI suite b is unstable; the font zip licence and the root `.gitignore` await a decision.
+- **Speed:** the controller's 30 % is PWM 24 of 255 (cap 50 % = PWM 40); the course library
+  drives at PWM 80. The wheels may not turn at 30 %.
+- **I²C facts:** the controller type is confirmed (user, from the professor). 0x30, GPIO19/21 and
+  the registers come from the library code only.
+- The reboot-loop cause (watchdog vs brownout) was not confirmed from a serial log; the
+  diagnostic build boots.
+- Never flash `ESP32MecanumCar.ino` (it moves on boot).
+- Local, never committed: `wifi_secrets.h`, `ld06.*` (licence open), `MecanumCar_v2.*` (no
+  licence).
+- From M1: GUI suite b instability; font licence and root `.gitignore` decisions open.
 
 ## Key decisions
-- Phase B never modifies Codes 01-06, `localisation_common.py`, `scans/` or the Stage 3 files.
-- `docs/decisions/2026-11-04_*`; the newest is the MVP decision (approach B).
-- No flashing, COM port or robot operation by Claude; hardware stages only with your approval.
+- Codes 01-06, `localisation_common.py`, `scans/` and the original SLAM checkout are never
+  modified.
+- No flashing, COM port or motor activation by Claude.
 
-## Verified tests (2026-11-04, this worktree)
+## Verified tests (2026-11-04, this worktree, uncommitted tree)
 | Command | Result |
 |---------|--------|
-| AGENTS.md headless suite + `test_autonomy_protocol test_autonomy_link test_autonomy_wifi test_autonomy_http test_autonomy_teleop` | 578 OK (280 s) |
-| `.\.venv\Scripts\python.exe -m unittest test_gui_robot_controller -v` | 12 OK (18 s) |
-| `.\.venv\Scripts\python.exe -m unittest test_gui_map_display test_gui_workspace -v` | 12 OK (78 s), one run |
-| `.\.venv\Scripts\python.exe gui_smoke_test.py` | PASS |
-| `compile_check.py` on the 221c778 build | PASSED (947,180 B flash, 72 %) |
-| `python firmware\ESP32SlamRobot\compile_check.py --ld06-zip … --mecanum-zip … --libraries <scratch>` on the diagnostic build (from the worktree, after restoring `wifi_secrets.example.h`) | PASSED: no secrets → `#error`; example password → `static_assert`; test password → 950,032 B flash (72 %), 93,992 B RAM (28 %). `--warnings all`: only the known `ld06.cpp` warning |
-| `-m unittest test_firmware_static test_autonomy_http test_autonomy_teleop test_autonomy_protocol test_autonomy_link test_autonomy_wifi` (after the diagnostic changes) | 153 OK |
-| AGENTS.md headless suite + all autonomy modules + `test_firmware_static` + `test_autonomy_live_localisation` (after the tracker) | 593 OK (316 s) |
-| `python -m autonomy.localisation_sim` (240-scan route) | 240/240 ok; `results/live_localisation_20261104_152215/` |
+| `python firmware\ESP32SlamRobot\compile_check.py --ld06-zip … --mecanum-zip … --libraries <scratch>` | PASSED: 952,240 B flash (72 %), 94,056 B RAM (28 %); no-secrets and example-password builds refused |
+| `-m unittest test_firmware_static test_autonomy_http test_autonomy_teleop` | 51 OK |
+| `-m unittest test_gui_robot_controller` | 14 OK, 3 runs in a row |
+| Full headless suite (AGENTS.md list + autonomy + firmware static + live localisation), after the controller simplification | 600 OK (301 s) |
 
 ## Untested / unverified
-- **Firmware: COMPILE-VERIFIED / HARDWARE-UNTESTED.** Never run on the robot: watchdog, leases,
-  stops, wheel directions, Wi-Fi range and the motor board's reset behaviour are unverified.
-- The controller in REAL ROBOT mode has only talked to the fake robot.
-- Arduino IDE 2 itself was not used (arduino-cli, the IDE's own compiler, was).
-- The parked v2 C++ (never compiled).
+- Everything on hardware: motor diagnostics, I²C answers, wheel motion, PWM dead-band, the
+  watchdog and the stall check.
+- M1 GUI suites and `gui_smoke_test.py` (no Workspace file changed on this branch).

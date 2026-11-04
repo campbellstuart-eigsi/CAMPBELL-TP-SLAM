@@ -48,18 +48,26 @@ class ConnectionTests(TeleopTestCase):
         self.assertEqual((snap.link, snap.armed, snap.command), ("disconnected", False, (0, 0, 0)))
         self.assertEqual(self.robot.drives, [])
 
-    def test_connect_is_latched_until_arm(self):
+    def test_connect_alone_never_arms_or_drives(self):
         self.connect()
-        self.teleop.press("forward")
         time.sleep(0.3)
         self.assertEqual(self.robot.drives, [])
         self.assertTrue(self.teleop.snapshot().stop_latched)
         self.assertFalse(self.robot.armed)
 
-    def test_keys_held_before_arm_never_start_a_move(self):
+    def test_first_key_press_arms_then_drives(self):
         self.connect()
         self.teleop.press("forward")
-        self.teleop.request_arm()
+        self.assertTrue(wait_until(lambda: self.robot.move_active))
+        self.assertTrue(self.robot.armed)
+        self.assertEqual(self.moving_drives()[0][:4], (30, 0, 0, LEASE_MS))
+        self.teleop.release("forward")
+        self.assertTrue(wait_until(lambda: not self.robot.move_active, 0.3))
+
+    def test_key_released_before_arm_completes_never_moves(self):
+        self.connect()
+        self.teleop.press("forward")
+        self.teleop.release("forward")
         self.assertTrue(wait_until(lambda: self.teleop.snapshot().armed))
         time.sleep(0.3)
         self.assertEqual(self.moving_drives(), [])
@@ -158,6 +166,41 @@ class StopAndFailureTests(TeleopTestCase):
         self.assertTrue(snap.stop_latched)
         self.assertFalse(snap.armed)
 
+    def test_after_stop_a_held_key_must_be_released_to_drive_again(self):
+        self.connect()
+        self.teleop.press("forward")
+        self.assertTrue(wait_until(lambda: self.robot.move_active))
+        self.teleop.stop()
+        self.assertTrue(wait_until(lambda: not self.robot.armed, 0.3))
+        count = len(self.moving_drives())
+        for _ in range(5):                         # keyboard auto-repeat of the held key
+            self.teleop.press("forward")
+        time.sleep(0.4)
+        self.assertEqual(len(self.moving_drives()), count)
+        self.assertFalse(self.robot.armed)
+        self.teleop.release("forward")             # a deliberate new press arms and drives
+        time.sleep(1.0)                            # past AUTO_ARM_RETRY_MS
+        self.teleop.press("forward")
+        self.assertTrue(wait_until(lambda: self.robot.move_active))
+        self.teleop.release("forward")
+
+    def test_stop_during_automatic_arm_leaves_the_robot_disarmed(self):
+        self.connect()
+        link = self.teleop.link
+        original_arm = link.arm
+
+        def arm_while_stop_is_pressed():
+            self.teleop.stop()                     # STOP lands while /arm is in flight
+            return original_arm()
+
+        link.arm = arm_while_stop_is_pressed
+        self.teleop.press("forward")
+        self.assertTrue(wait_until(lambda: self.teleop.snapshot().busy == "", 2.0))
+        time.sleep(0.3)
+        self.assertFalse(self.robot.armed)         # the ARM after the STOP was undone
+        self.assertFalse(self.teleop.snapshot().armed)
+        self.assertEqual(self.moving_drives(), [])
+
     def test_delayed_drive_after_stop_and_rearm_is_refused(self):
         self.arm()
         self.teleop.press("forward")
@@ -214,20 +257,30 @@ class StopAndFailureTests(TeleopTestCase):
         self.assertLess(time.monotonic() - started, 0.05)
 
 
-class RealRobotGatingTests(TeleopTestCase):
-    def test_arm_needs_safety_ack_each_connection(self):
-        self.teleop.set_mode(True)
-        self.connect()
-        self.teleop.request_arm()
-        self.assertTrue(wait_until(lambda: any("safety" in text for _, text in
-                                               self.teleop.snapshot().errors)))
-        self.assertFalse(self.robot.armed)
-        self.teleop.set_safety_ack(True)
-        self.teleop.request_arm()
-        self.assertTrue(wait_until(lambda: self.teleop.snapshot().armed))
-        self.teleop.request_disconnect()
-        self.assertTrue(wait_until(lambda: self.teleop.snapshot().link == "disconnected"))
-        self.assertFalse(self.teleop.snapshot().safety_ack)
+class RejectionReasonTests(TeleopTestCase):
+    def test_locked_build_shows_motors_locked(self):
+        locked = FakeHttpRobot(locked=True).start()
+        self.addCleanup(locked.close)
+        self.assertTrue(self.teleop.request_connect(locked.url))
+        self.assertTrue(wait_until(lambda: self.teleop.snapshot().link == "ok"))
+        self.assertTrue(wait_until(lambda: not self.teleop.snapshot().busy))
+        self.teleop.press("forward")               # the automatic ARM is refused
+        self.assertTrue(wait_until(lambda: any("cannot drive: MOTORS_LOCKED (HTTP 423)" in text
+                                               for _, text in self.teleop.snapshot().errors)))
+        self.assertFalse(self.teleop.snapshot().armed)
+        for _ in range(5):                         # auto-repeat does not retry the ARM
+            self.teleop.press("forward")
+        time.sleep(1.2)
+        self.assertEqual(locked.rejects, 1)
+        self.assertEqual(locked.drives, [])        # nothing is sent while not armed
+
+    def test_drive_refusal_shows_the_firmware_reason(self):
+        self.arm()
+        self.robot.armed = False                   # e.g. the Wi-Fi-drop event disarmed it
+        self.teleop.press("forward")
+        self.assertTrue(wait_until(lambda: any("DISARMED (HTTP 423)" in text for _, text
+                                               in self.teleop.snapshot().errors)))
+        self.assertEqual(self.teleop.snapshot().held, ())
 
 
 if __name__ == "__main__":

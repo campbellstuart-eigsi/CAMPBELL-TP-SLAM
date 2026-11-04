@@ -148,7 +148,8 @@ class HttpRobotLink(RobotLink):
                 return CommandResult(False, f"armed, but /status failed: {error}")
             self.stop_event.clear()
             return CommandResult(True)
-        return CommandResult(False, f"HTTP {code} {body[:40]!r}")
+        # The firmware's own reason text, e.g. "MOTORS_LOCKED" or "MOTOR_TASK_FAILED".
+        return CommandResult(False, f"{body[:40].decode('ascii', 'replace').strip()} (HTTP {code})")
 
     def stop(self):
         """Stops and disarms. Safe from any thread; interrupts a waiting move()."""

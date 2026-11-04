@@ -4,23 +4,26 @@ The GUI (autonomy/controller_ui.py) only calls the non-blocking methods below
 and reads snapshot() from a Tk timer. Two worker threads own the network:
 
   control   sends /drive leases of LEASE_MS (300 ms), renewed every RENEW_MS
-            while a movement key is held; runs connect/arm/disarm/disconnect
+            while a movement key is held; runs connect/arm/disconnect
   telemetry polls /status and /scan2 every 250 ms
+
+The user only connects, drives and stops: there is no ARM button. A NEW press
+of a movement key while stopped sends /arm (the firmware boots disarmed and
+/stop disarms it), then drives; the firmware decides whether arming is allowed
+(it refuses while MOTORS_LOCKED, and says why).
 
 Safety rules (on top of the firmware's own lease expiry):
   - movement intent is the set of held keys, read at send time: there is no
     command queue, so an old movement can never be sent later;
   - releasing every key sends a zero /drive at once; release_all() (focus
     loss, disconnect, any failure) does the same;
-  - STOP runs on its own thread immediately, disarms the robot and latches:
-    nothing moves again until ARM succeeds;
+  - STOP runs on its own thread immediately, disarms the robot and latches.
+    Keys held at that moment must be RELEASED before they can drive again, so
+    keyboard auto-repeat never restarts the robot after STOP;
   - a failed /drive, a robot that reports itself disarmed or restarted, or
-    LINK_SILENCE_MS without /status latch the stop and clear the intent; the
-    robot then stops on its own when its lease runs out;
+    LINK_SILENCE_MS without /status latch the same way;
   - manual commands are raw PWM percent, capped at MAX_MANUAL_PCT. They need
-    no distance calibration; HttpRobotLink.move() (distance moves) still does;
-  - in REAL ROBOT mode ARM is refused until the bench safety checks are
-    confirmed for the current connection.
+    no distance calibration; HttpRobotLink.move() (distance moves) still does.
 """
 import threading
 import time
@@ -37,6 +40,7 @@ MAX_MANUAL_PCT = 50
 DEFAULT_DRIVE_PCT = 30
 DEFAULT_TURN_PCT = 30
 MAX_ERRORS = 8
+AUTO_ARM_RETRY_MS = 1000     # a refused automatic ARM is retried at most this often
 
 # action -> (vx, vy, wz) direction; signs as the firmware's mixWheels():
 # +vx forward, +vy left, +wz counter-clockwise.
@@ -68,8 +72,7 @@ class Snapshot:
     real_robot: bool = False
     armed: bool = False              # ARM succeeded and nothing has latched a stop since
     stop_latched: bool = True
-    safety_ack: bool = False
-    busy: str = ""                   # the action in progress, if any
+    busy: str = ""                 # the action in progress, if any
     status: dict = None              # the latest /status
     status_age_ms: int = None
     scan_seq: int = 0
@@ -96,10 +99,12 @@ class Teleop:
         self.url = ""
         self.link_state = "disconnected"
         self.real_robot = False
-        self.safety_ack = False
         self.armed = False
         self.stop_latched = True
         self.held = set()
+        self.blocked = set()         # keys held at a latched stop: must be released first
+        self._last_auto_arm_ms = None
+        self._stops = 0              # latched stops so far (an ARM in flight checks it)
         self.drive_pct = DEFAULT_DRIVE_PCT
         self.turn_pct = DEFAULT_TURN_PCT
         self.status = None
@@ -123,23 +128,28 @@ class Teleop:
 
     # -- GUI side: never blocks ------------------------------------------------
     def press(self, action):
+        """A movement key went down. While stopped, a new press also arms."""
         if action not in ACTIONS:
             return
         with self.lock:
-            if action in self.held:
-                return               # key auto-repeat
+            if action in self.held or action in self.blocked:
+                return               # auto-repeat, or held through a STOP: release first
             self.held.add(action)
+            if self.stop_latched and self.link_state == "ok":
+                self._auto_arm_locked()
         self._wake.set()
 
     def release(self, action):
         with self.lock:
             self.held.discard(action)
+            self.blocked.discard(action)
         self._wake.set()
 
     def release_all(self):
-        """Focus loss, disconnect, failures: no movement intent at all."""
+        """Focus loss, disconnect: no movement intent at all (the next press is new)."""
         with self.lock:
             self.held.clear()
+            self.blocked.clear()
         self._wake.set()
 
     def set_speeds(self, drive_pct, turn_pct):
@@ -153,12 +163,7 @@ class Teleop:
             if self.link is not None or self.busy:
                 return False         # the mode changes only while disconnected
             self.real_robot = bool(real_robot)
-            self.safety_ack = False
             return True
-
-    def set_safety_ack(self, value):
-        with self.lock:
-            self.safety_ack = bool(value)
 
     def stop(self):
         """STOP: latch, clear intent and send /stop now, on its own thread."""
@@ -177,11 +182,8 @@ class Teleop:
         return self._request("disconnect")
 
     def request_arm(self):
+        """Arm now (tests; the GUI arms through press())."""
         return self._request("arm")
-
-    def request_disarm(self):
-        self.release_all()
-        return self._request("disarm")
 
     def command(self):
         with self.lock:
@@ -193,8 +195,7 @@ class Teleop:
             calibrated = bool(self.link and self.link.calibration.measured)
             return Snapshot(
                 link=self.link_state, url=self.url, real_robot=self.real_robot,
-                armed=self.armed, stop_latched=self.stop_latched, safety_ack=self.safety_ack,
-                busy=self.busy, status=dict(self.status) if self.status else None,
+                armed=self.armed, stop_latched=self.stop_latched, busy=self.busy, status=dict(self.status) if self.status else None,
                 status_age_ms=age, scan_seq=self.scan_seq, scan_points=self.scan_points,
                 command=self._command_locked(), held=tuple(sorted(self.held)),
                 drive_pct=self.drive_pct, turn_pct=self.turn_pct, calibrated=calibrated,
@@ -225,13 +226,27 @@ class Teleop:
                 del self.errors[:-MAX_ERRORS]
 
     def _latch_locked(self, reason):
-        """Stop intent: clear the keys; no movement until ARM succeeds again."""
+        """Stop intent: clear the keys; keys still held must be released before they
+        drive again; no movement until ARM succeeds again."""
+        self.blocked |= self.held
         self.held.clear()
+        self._stops += 1
         self.stop_latched = True
         self.armed = False
         self._sent_motion = False    # a /stop, not a zero /drive, ends the motion
         if reason:
             self._error(reason)
+
+    def _auto_arm_locked(self):
+        """Queue /arm for a new key press while stopped (at most every AUTO_ARM_RETRY_MS)."""
+        now = self._now()
+        if self._action is not None or self.busy:
+            return
+        if self._last_auto_arm_ms is not None and now - self._last_auto_arm_ms < AUTO_ARM_RETRY_MS:
+            return
+        self._last_auto_arm_ms = now
+        self._action = ("arm", None)
+        self.busy = "arm"
 
     def _command_locked(self):
         if self.stop_latched or not self.armed or self.link_state != "ok":
@@ -301,7 +316,7 @@ class Teleop:
             if code == 200:
                 return
             if code == 423:
-                self._latch_locked("the robot is DISARMED: press ARM")
+                self._latch_locked(f"/drive refused: {text} (HTTP 423): the robot is not armed")
             else:
                 self.held.clear()
                 self._error(f"/drive refused: HTTP {code} {text}")
@@ -361,8 +376,9 @@ class Teleop:
             self.link, self.link_state = link, "ok"
             self.status, self.status_ms = status, self._now()
             self.boot_id = status["boot_id"]
-            self.safety_ack = False  # confirmed again for every connection
             self._latch_locked(None)
+            self.blocked.clear()     # the first key press after Connect arms and drives
+            self._last_auto_arm_ms = None
             self.last_reply = "connected"
 
     def _do_disconnect(self):
@@ -376,29 +392,26 @@ class Teleop:
             self.status = self.status_ms = self.boot_id = None
             self.scan_seq, self.scan_points = 0, ()
             self._sent_motion = False
-            self.safety_ack = False
 
     def _do_arm(self):
         with self.lock:
             link = self.link
+            stops_before = self._stops
             if link is None or self.link_state != "ok":
                 self._error("ARM refused: not connected")
                 return
-            if self.real_robot and not self.safety_ack:
-                self._error("ARM refused: confirm the bench safety checks first")
-                return
         result = link.arm()
         with self.lock:
-            if result.ok:
-                self.held.clear()    # keys pressed before ARM never start a move
+            stopped_meanwhile = self._stops != stops_before
+            if result.ok and not stopped_meanwhile:
+                # Keys still held from the press that armed it now drive; a key
+                # released meanwhile does nothing.
                 self.armed, self.stop_latched = True, False
                 self.last_reply = "ARMED"
-            else:
-                self._error(f"ARM failed: {result.reason}")
-
-    def _do_disarm(self):
-        with self.lock:
-            link = self.link
-            self._latch_locked(None)
-        if link is not None:
-            self._send_stop(link)
+                return
+            if not result.ok:
+                self.blocked |= self.held  # no retry by auto-repeat: release, press again
+                self.held.clear()
+                self._error(f"cannot drive: {result.reason}")
+        if result.ok and stopped_meanwhile:
+            self._send_stop(link)     # a STOP raced this ARM: the robot must end disarmed

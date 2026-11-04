@@ -44,6 +44,18 @@ class ConnectTests(HttpLinkTestCase):
         with self.assertRaises(LinkError):
             link.connect()
 
+    def test_locked_build_arm_reason_is_the_firmware_text(self):
+        locked = FakeHttpRobot(locked=True).start()
+        self.addCleanup(locked.close)
+        link = HttpRobotLink(locked.url)
+        link.connect()
+        result = link.arm()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "MOTORS_LOCKED (HTTP 423)")
+        status = link.status()
+        self.assertEqual((status["motors_locked"], status["last_reject"], status["rejects"]),
+                         (1, "MOTORS_LOCKED", 1))
+
     def test_boots_disarmed_and_move_refused(self):
         self.link.connect()
         result = self.link.move(0.1, 0.0)

@@ -67,6 +67,27 @@ class BootSafetyTests(unittest.TestCase):
         arm = text[text.index('server.on("/arm"'):]
         self.assertLess(arm.index("MOTORS_LOCKED"), arm.index("armed = true"))
 
+    def test_i2c_ack_is_read_with_a_pull_up_and_probed_without_writes(self):
+        text = source()
+        write = function_body(text, "bool writeRegister(")
+        self.assertNotIn("car.IIC_RecvACK()", write)
+        self.assertEqual(write.count("recvAckPulled()"), 3)
+        self.assertIn("INPUT_PULLUP", function_body(text, "bool recvAckPulled("))
+        probe = function_body(text, "bool probeAddress(")
+        self.assertNotIn("IIC_SendByte(reg", probe)       # address only: no register written
+        setup = function_body(text, "void setup()")
+        self.assertLess(setup.index("car.Stop()"), setup.index("probeAddress("))
+        self.assertIn("probeAddress(CONTROL_I2C_ADDRESS)", setup)
+
+    def test_rejections_and_stops_are_reported(self):
+        text = source()
+        status = function_body(text, "void sendStatus(")
+        for field in ("last_reject", "rejects", "last_stop", "pwm", "i2c_ack_0x30",
+                      "i2c_writes", "motors_locked"):
+            self.assertIn(f'\\"{field}\\"', status)
+        arm = text[text.index('server.on("/arm"'):]
+        self.assertLess(arm.index("noteRejectLocked"), arm.index("MOTORS_LOCKED\");"))
+
     def test_boot_checkpoints_cover_each_subsystem(self):
         text = source()
         for step in range(1, 9):

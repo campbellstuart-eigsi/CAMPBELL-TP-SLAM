@@ -50,6 +50,16 @@ SIM_FULL_TURN_RAD_S = math.radians(120.0)
 SIM_MAX_RANGE_M = 12.0
 
 
+MAX_PWM = 80  # the firmware's MAX_PWM (100 % in /drive)
+
+
+def mix_wheels(vx, vy, wz):
+    """Signed PWM per wheel (FL, FR, RL, RR), as the firmware's mixWheels()."""
+    mix = (vx - vy - wz, vx + vy + wz, vx + vy - wz, vx - vy + wz)
+    largest = max(100, *(abs(value) for value in mix))
+    return [int(value * MAX_PWM / largest) for value in mix]
+
+
 def _distance_to_segment(x, y, wall):
     (x1, y1), (x2, y2) = wall
     ex, ey = x2 - x1, y2 - y1
@@ -84,9 +94,12 @@ class FakeHttpRobot:
     """room=True: the robot moves in ROOM_WALLS and scans it (simulator mode);
     otherwise every scan is `points` (default sample_points(); tests)."""
 
-    def __init__(self, points=None, room=False):
+    def __init__(self, points=None, room=False, locked=False):
         self.lock = threading.Lock()
         self.room = room
+        self.locked = locked        # the diagnostic build: /arm answers 423 MOTORS_LOCKED
+        self.last_reject = "none"   # as the firmware's /status diagnostics
+        self.rejects = 0
         self.pose = (0.0, 0.0, 0.0)  # x m, y m, theta rad (room mode only)
         self.points = sample_points() if points is None else tuple(points)
         if room:
@@ -203,15 +216,23 @@ class FakeHttpRobot:
                 "scan_age_ms": now - self.scan_end, "scan_points": len(self.points),
                 "lidar_dps": 3600, "crc_fails": 0, "oversize_scans": 0, "i2c_nacks": 0,
                 "guard_on": 0, "guard_trips": 0, "sector_mm": [65535] * 8, "clients": 1,
-                "free_heap": 200000}
+                "free_heap": 200000, "motors_locked": int(self.locked), "motor_ack": 1,
+                "i2c_sda_idle_high": 1, "i2c_ack_0x30": 1, "i2c_ack_0x31": 0,
+                "pwm": mix_wheels(*self.wheel), "last_stop": "none",
+                "rejects": self.rejects, "last_reject": self.last_reject}
+
+    def _reject(self, code, reason):
+        self.rejects += 1
+        self.last_reject = reason
+        return code, reason
 
     def _drive(self, vx, vy, wz, time_ms, seq, now):
         if seq != 0 and seq <= self.last_seq:
-            return 409, "STALE_SEQ"
+            return self._reject(409, "STALE_SEQ")
         if not self.armed or self.fault:
-            return 423, "DISARMED"
+            return self._reject(423, "DISARMED")
         if now - self.scan_end >= LIDAR_STALE_MS or self.scan_seq == 0:
-            return 503, "NO_LIDAR"
+            return self._reject(503, "NO_LIDAR")
         if seq != 0:
             self.last_seq = seq
         if time_ms <= 0:
@@ -252,6 +273,8 @@ class FakeHttpRobot:
             kind, code, body = "text/plain", 200, "OK"
             if url.path == "/status":
                 kind, body = "application/json", json.dumps(self._status(now))
+            elif url.path == "/arm" and self.locked:
+                code, body = self._reject(423, "MOTORS_LOCKED")
             elif url.path == "/arm":
                 self._end_move(now)
                 self.fault = False

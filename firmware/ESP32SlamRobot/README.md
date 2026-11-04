@@ -147,6 +147,45 @@ rear-right 5/6 (from `MecanumCar_v2.cpp`; which motor is physically "front" is u
    Observe whether the controller holds PWM across an ESP32 reset. **Only then** rebuild with
    `MOTORS_LOCKED 0` for S1b.
 
+**S1a-motor: why the controller cannot move the robot (still `MOTORS_LOCKED 1`, no motion
+possible).** The diagnostics answer each question; nothing here writes a non-zero PWM.
+1. **Which build is running?** In `/status`:
+   - `motors_locked: 1`: the locked diagnostic build. ARM is refused **by design**, so nothing
+     can move. This is the expected answer now.
+   - no `motors_locked` field: an older build without the lock.
+   - no `i2c_ack_0x30` field: a build older than these motor diagnostics.
+2. **ARM:** the controller's Messages show the firmware's reason, e.g.
+   `ARM failed: MOTORS_LOCKED (HTTP 423)`. `/status` `last_reject` / `rejects` and the serial
+   line `[CMD] refused: ...` show the same reason.
+3. **Does the controller answer on I²C?**
+   - Boot log `[I2C] SDA GPIO19 idle ...; address 0x30 ...; control 0x31 ...` and its
+     `VERDICT`; `/status` `i2c_sda_idle_high`, `i2c_ack_0x30`, `i2c_ack_0x31`, `i2c_nacks`.
+   - `0x30 ACK` + `0x31 no ACK` + SDA idle HIGH = the controller answers.
+   - `0x30 NO ACK` = check the motor-board power (battery switch on?) and SDA→GPIO19,
+     SCL→GPIO21, GND.
+   - `0x31` also ACKs, or SDA idle LOW = the readings are unreliable (bus held low).
+   - `i2c_nacks` must stay 0 while the 200 ms zero-PWM refresh runs.
+4. **Power:** the ESP32 can run from USB alone, but the motor controller needs the battery. With
+   motor power off, step 3 should show `0x30 NO ACK`; with it on, `ACK`. That difference is
+   itself a useful check that the controller is the device answering. Use a meter for the
+   battery voltage; the firmware cannot measure it.
+5. **LiDAR:** `/status` `scan_age_ms` must stay under 500. Over that, `/drive` is refused
+   (`NO_LIDAR`) and a running move ends (`last_stop: LiDAR stale`).
+6. **In REAL ROBOT mode** the controller keeps ARM greyed out until the three bench-safety boxes
+   are ticked.
+
+**Before S1b, the physical gate** (the S1 wheel spin is unexplained):
+- motor power off: the cut-off is reachable, and switching it stops a spinning wheel;
+- with the wheels in the air: reset the ESP32 (EN) while watching the wheels.
+
+Only then rebuild with `MOTORS_LOCKED 0`.
+
+**Expected at S1b:** `[CMD] drive accepted ... PWM FL .. FR ..` and `/status` `pwm` non-zero
+during a key press, then `last_stop: lease ended` after release. The controller's default 30 %
+is **PWM 24 of 255**, and its 50 % cap is PWM 40. The course library drives at PWM 80, so 30 %
+may be too weak to turn the wheels. If PWM is non-zero but the wheels do not turn, raise Drive %
+in the controller (to 50 %) before changing any firmware value.
+
 **S1b, with `MOTORS_LOCKED 0`, only after S1a passes.** Read `/status` throughout, or use
 `robot_controller.py` in REAL ROBOT mode. Each step must stop the wheels.
 1. Boot: the wheels stay still; `/status` shows `armed:0`.

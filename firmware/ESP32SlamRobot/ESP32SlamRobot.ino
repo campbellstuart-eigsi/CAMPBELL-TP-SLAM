@@ -86,9 +86,13 @@ const uint8_t  GUARD_MIN_POINTS = 3;
 #define LIDAR_BAUD 230400
 LD06 lidar(Serial2, LD06_PWM_PIN);
 
-mecanumCar car(19, 21);  // Bit-banged I2C: SDA 19, SCL 21. Only motorStep() uses it after setup.
+const int MOTOR_SDA = 19;  // as the course sketch: mecanumCar(19, 21)
+const int MOTOR_SCL = 21;
+mecanumCar car(MOTOR_SDA, MOTOR_SCL);  // Bit-banged I2C. Only motorStep() uses it after setup.
 
-const uint8_t MOTOR_I2C_WRITE = 0x30 << 1;
+const uint8_t MOTOR_I2C_ADDRESS = 0x30;
+const uint8_t MOTOR_I2C_WRITE = MOTOR_I2C_ADDRESS << 1;
+const uint8_t CONTROL_I2C_ADDRESS = 0x31;  // nothing should answer here (probe sanity check)
 // {reverse register, forward register}, same as Motor_Upper_L() etc. in MecanumCar_v2.cpp.
 enum { FL, FR, RL, RR };
 const uint8_t WHEEL_REG[4][2] = {{3, 4}, {1, 2}, {7, 8}, {5, 6}};
@@ -127,6 +131,19 @@ volatile uint32_t motorHeartbeatMs = 0;   // written by the motor task every cyc
 bool motorStopAcked = false;              // the motor board ACKed the zero-PWM write at boot
 bool motorTaskOk = false;                 // /arm is refused without the motor task
 bool wifiStarted = false;
+
+// MOTOR / COMMAND DIAGNOSTICS (read-only reporting in /status and the serial log)
+bool sdaIdleHigh = false;                 // SDA reads HIGH with only the pull-up: bus not held low
+bool probeAck30 = false;                  // the controller answered its address (no register written)
+bool probeAck31 = false;                  // control: should be false, else ACK readings are unreliable
+uint32_t i2cWrites = 0;                   // writeWheels() calls (8 register writes each)
+int16_t appliedPwm[4] = {0, 0, 0, 0};     // signed PWM last written per wheel (FL, FR, RL, RR)
+const char* const NO_REASON = "none";
+const char* lastStop = NO_REASON;         // why the last move ended
+const char* lastReject = NO_REASON;       // why the last /arm or /drive was refused
+uint32_t lastRejectMs = 0;
+uint32_t rejectCount = 0;
+uint32_t driveAccepted = 0;
 
 const char* resetReasonName(esp_reset_reason_t reason) {
   switch (reason) {
@@ -173,18 +190,70 @@ uint16_t posez = 0;
 // ------------------------------------------------------------
 // MOTOR OUTPUT: runs only inside setup() and motorStep()
 // ------------------------------------------------------------
+// The ACK clock of mecanumCar::IIC_RecvACK(), but SDA is sampled with the internal
+// pull-up: the library samples a floating line, so a missing controller could read
+// as an ACK. Returns true for NACK (SDA high), like the library.
+bool recvAckPulled() {
+  digitalWrite(MOTOR_SCL, LOW);
+  pinMode(MOTOR_SDA, INPUT_PULLUP);
+  delayMicroseconds(1);
+  digitalWrite(MOTOR_SCL, HIGH);
+  delayMicroseconds(2);
+  const bool nack = digitalRead(MOTOR_SDA);
+  digitalWrite(MOTOR_SCL, LOW);
+  pinMode(MOTOR_SDA, OUTPUT);
+  return nack;
+}
+
 bool writeRegister(uint8_t reg, uint8_t value) {
   // Same bytes as mecanumCar::Writebyte(), but the ACK bits are kept.
   bool nack = false;
   car.IIC_Start();
   car.IIC_SendByte(MOTOR_I2C_WRITE);
-  nack |= car.IIC_RecvACK();
+  nack |= recvAckPulled();
   car.IIC_SendByte(reg);
-  nack |= car.IIC_RecvACK();
+  nack |= recvAckPulled();
   car.IIC_SendByte(value);
-  nack |= car.IIC_RecvACK();
+  nack |= recvAckPulled();
   car.IIC_Stop();
   return !nack;
+}
+
+// Address-only probe: START, address + write bit, ACK?, STOP. No register is written.
+bool probeAddress(uint8_t address) {
+  car.IIC_Start();
+  car.IIC_SendByte(address << 1);
+  const bool nack = recvAckPulled();
+  car.IIC_Stop();
+  return !nack;
+}
+
+// SDA level with only the pull-up attached (setup() only, before the motor task).
+bool readSdaIdle() {
+  pinMode(MOTOR_SDA, INPUT_PULLUP);
+  delayMicroseconds(20);
+  const bool high = digitalRead(MOTOR_SDA);
+  pinMode(MOTOR_SDA, OUTPUT);
+  digitalWrite(MOTOR_SDA, HIGH);
+  return high;
+}
+
+const char* moveResultName(MoveResult result) {
+  switch (result) {
+    case MOVE_OK:       return "OK";
+    case MOVE_DISARMED: return "DISARMED";
+    case MOVE_NO_LIDAR: return "NO_LIDAR";
+    case MOVE_BLOCKED:  return "BLOCKED";
+    case MOVE_STALE:    return "STALE_SEQ";
+  }
+  return "?";
+}
+
+// Call with stateMux held.
+void noteRejectLocked(const char* reason, uint32_t now) {
+  lastReject = reason;
+  lastRejectMs = now;
+  rejectCount++;
 }
 
 bool writeWheels(const int16_t wheel[4]) {
@@ -240,14 +309,23 @@ void motorStep() {
 
   portENTER_CRITICAL(&stateMux);
   bool stopNow = !armed || fault;
+  const char* stopReason = !armed ? "disarmed (STOP, Wi-Fi drop or boot)" : "fault";
   if (moveActive) {
-    if ((uint32_t)(now - moveStartMs) >= moveLeaseMs) stopNow = true;
-    if ((uint32_t)(now - scanEndMs) >= LIDAR_STALE_MS) stopNow = true;
+    if ((uint32_t)(now - moveStartMs) >= moveLeaseMs) {
+      stopNow = true;
+      if (armed && !fault) stopReason = "lease ended";
+    }
+    if ((uint32_t)(now - scanEndMs) >= LIDAR_STALE_MS) {
+      stopNow = true;
+      stopReason = "LiDAR stale";
+    }
     if (pathBlockedLocked(moveVx, moveVy)) {
       stopNow = true;
+      stopReason = "stop zone";
       guardTrips++;
     }
   }
+  if (stopNow && moveActive) lastStop = stopReason;  // diagnostics only
   if (stopNow) endMoveLocked(now);
   for (int i = 0; i < 4; ++i) target[i] = moveWheel[i];
   portEXIT_CRITICAL(&stateMux);
@@ -265,6 +343,10 @@ void motorStep() {
   const bool ok = writeWheels(target);
   lastRefreshMs = now;
   for (int i = 0; i < 4; ++i) applied[i] = target[i];
+  portENTER_CRITICAL(&stateMux);
+  i2cWrites++;
+  for (int i = 0; i < 4; ++i) appliedPwm[i] = target[i];
+  portEXIT_CRITICAL(&stateMux);
   if (!ok) {
     portENTER_CRITICAL(&stateMux);
     i2cNacks++;
@@ -314,7 +396,11 @@ MoveResult requestMove(int vx, int vy, int wz, int timeMs, uint32_t seq) {
     result = MOVE_NO_LIDAR;
   } else if (pathBlockedLocked(vx, vy)) {
     result = MOVE_BLOCKED;
+  }
+  if (result != MOVE_OK) {
+    noteRejectLocked(moveResultName(result), now);  // diagnostics only
   } else {
+    driveAccepted++;
     if (seq != 0) lastCommandSeq = seq;
     if (timeMs <= 0) {
       endMoveLocked(now);
@@ -502,18 +588,31 @@ void sendStatus(AsyncWebServerRequest* req) {
   const uint16_t points = scanPoints, speed = lidarSpeedDps;
   uint16_t sectors[8];
   for (int i = 0; i < 8; ++i) sectors[i] = sectorMinMm[i];
+  int16_t pwm[4];
+  for (int i = 0; i < 4; ++i) pwm[i] = appliedPwm[i];
+  const uint32_t writes = i2cWrites, rejects = rejectCount, accepted = driveAccepted;
+  const uint32_t rejectAge = rejectCount ? now - lastRejectMs : 0;
+  const char* rejectWhy = lastReject;
+  const char* stopWhy = lastStop;
   portEXIT_CRITICAL(&stateMux);
 
-  char json[640];
+  char json[1024];
   snprintf(json, sizeof(json),
            "{\"boot_id\":%lu,\"uptime_ms\":%lu,\"reset_reason\":%d,\"boot_count\":%lu,"
-           "\"motor_ack\":%d,\"motors_locked\":%d,\"armed\":%d,\"fault\":%d,"
+           "\"motor_ack\":%d,\"motors_locked\":%d,\"i2c_sda_idle_high\":%d,"
+           "\"i2c_ack_0x30\":%d,\"i2c_ack_0x31\":%d,\"i2c_writes\":%lu,"
+           "\"pwm\":[%d,%d,%d,%d],\"last_stop\":\"%s\",\"drive_accepted\":%lu,"
+           "\"rejects\":%lu,\"last_reject\":\"%s\",\"last_reject_age_ms\":%lu,"
+           "\"armed\":%d,\"fault\":%d,"
            "\"moving\":%d,\"lease_ms\":%lu,\"cmd_seq\":%lu,\"scan_seq\":%lu,\"scan_age_ms\":%lu,"
            "\"scan_points\":%u,\"lidar_dps\":%u,\"crc_fails\":%u,\"oversize_scans\":%lu,"
            "\"i2c_nacks\":%lu,\"guard_on\":%d,\"guard_trips\":%lu,"
            "\"sector_mm\":[%u,%u,%u,%u,%u,%u,%u,%u],\"clients\":%d,\"free_heap\":%lu}",
            (unsigned long)bootId, (unsigned long)now, (int)esp_reset_reason(),
-           (unsigned long)diagBootCount, motorStopAcked, MOTORS_LOCKED, armedNow, faultNow,
+           (unsigned long)diagBootCount, motorStopAcked, MOTORS_LOCKED, sdaIdleHigh,
+           probeAck30, probeAck31, (unsigned long)writes, pwm[0], pwm[1], pwm[2], pwm[3],
+           stopWhy, (unsigned long)accepted, (unsigned long)rejects, rejectWhy,
+           (unsigned long)rejectAge, armedNow, faultNow,
            movingNow, (unsigned long)remaining, (unsigned long)cmdSeq, (unsigned long)seq,
            (unsigned long)age, points, speed, lidar.getChecksumFailCount(),
            (unsigned long)oversize, (unsigned long)nacks, GUARD_ENABLED, (unsigned long)trips,
@@ -524,6 +623,50 @@ void sendStatus(AsyncWebServerRequest* req) {
   req->send(response);
 }
 
+// Serial lines for refused commands, accepted drives, move ends and I2C NACKs.
+// Called from loop(); at most one line of each kind per 500 ms.
+void logCommandDiagnostics() {
+  static uint32_t seenRejects = 0, seenAccepted = 0, seenNacks = 0, lastLogMs = 0;
+  static const char* seenStop = NO_REASON;
+  const uint32_t now = millis();  // after publishScan(): the scan age never wraps
+  if (now - lastLogMs < 500) return;
+  portENTER_CRITICAL(&stateMux);
+  const uint32_t rejects = rejectCount, accepted = driveAccepted, nacks = i2cNacks;
+  const char* why = lastReject;
+  const char* stop = lastStop;
+  const bool armedNow = armed;
+  const uint32_t scanAge = now - scanEndMs;
+  int16_t pwm[4];
+  for (int i = 0; i < 4; ++i) pwm[i] = appliedPwm[i];
+  portEXIT_CRITICAL(&stateMux);
+  bool logged = false;
+  if (rejects != seenRejects) {
+    Serial.printf("[CMD] refused: %s (%lu refused since boot; armed %d, LiDAR scan age %lu ms, "
+                  "MOTORS_LOCKED %d)\n", why, (unsigned long)rejects, armedNow,
+                  (unsigned long)scanAge, MOTORS_LOCKED);
+    seenRejects = rejects;
+    logged = true;
+  }
+  if (accepted != seenAccepted) {
+    Serial.printf("[CMD] drive accepted (%lu since boot); PWM FL %d FR %d RL %d RR %d\n",
+                  (unsigned long)accepted, pwm[0], pwm[1], pwm[2], pwm[3]);
+    seenAccepted = accepted;
+    logged = true;
+  }
+  if (stop != seenStop) {
+    Serial.printf("[MOTOR] move ended: %s\n", stop);
+    seenStop = stop;
+    logged = true;
+  }
+  if (nacks != seenNacks) {
+    Serial.printf("[I2C] a write to 0x%02X was not ACKed (%lu since boot)\n", MOTOR_I2C_ADDRESS,
+                  (unsigned long)nacks);
+    seenNacks = nacks;
+    logged = true;
+  }
+  if (logged) lastLogMs = now;
+}
+
 // ------------------------------------------------------------
 // SETUP
 // ------------------------------------------------------------
@@ -532,6 +675,11 @@ void setup() {
   car.Stop();
   const int16_t zero[4] = {0, 0, 0, 0};
   motorStopAcked = writeWheels(zero);  // the same zeros again, with the ACK bits checked
+  // Bus checks that write no register: SDA idle level, the controller's address, and
+  // an address nothing should answer (if that ACKs too, ACK readings mean nothing).
+  sdaIdleHigh = readSdaIdle();
+  probeAck30 = probeAddress(MOTOR_I2C_ADDRESS);
+  probeAck31 = probeAddress(CONTROL_I2C_ADDRESS);
 
   Serial.begin(115200);
   delay(200);
@@ -570,6 +718,19 @@ void setup() {
   checkpoint(1, motorStopAcked ? "zero PWM written; the motor board ACKed"
                                : "zero PWM written; the motor board did NOT ACK: the motors may "
                                  "not be stopped - cut motor power");
+  Serial.printf("[I2C] SDA GPIO%d idle %s; address 0x%02X %s; control 0x%02X %s\n", MOTOR_SDA,
+                sdaIdleHigh ? "HIGH (ok)" : "LOW (bus held low: wiring or unpowered board?)",
+                MOTOR_I2C_ADDRESS, probeAck30 ? "ACK" : "NO ACK", CONTROL_I2C_ADDRESS,
+                probeAck31 ? "ACK" : "no ACK");
+  if (!probeAck30) {
+    Serial.println("[I2C] VERDICT: the motor controller does not answer at 0x30. Check its "
+                   "power (battery switch on?), SDA->GPIO19, SCL->GPIO21 and GND.");
+  } else if (probeAck31 || !sdaIdleHigh) {
+    Serial.println("[I2C] VERDICT: ACK readings are unreliable (the control address also "
+                   "answered, or SDA is held low).");
+  } else {
+    Serial.println("[I2C] VERDICT: the motor controller answers at 0x30.");
+  }
   checkpoint(2, "Serial 115200 baud");
 
   // Priority above loop(), so a stalled loop() cannot delay a lease expiry.
@@ -636,10 +797,16 @@ void setup() {
   // ADDED ROUTES
   server.on("/arm", HTTP_GET, [](AsyncWebServerRequest* r) {
 #if MOTORS_LOCKED
+    portENTER_CRITICAL(&stateMux);
+    noteRejectLocked("MOTORS_LOCKED (arm)", millis());
+    portEXIT_CRITICAL(&stateMux);
     replyText(r, 423, "MOTORS_LOCKED");  // diagnostic build: movement disabled
     return;
 #endif
     if (!motorTaskOk) {
+      portENTER_CRITICAL(&stateMux);
+      noteRejectLocked("MOTOR_TASK_FAILED (arm)", millis());
+      portEXIT_CRITICAL(&stateMux);
       replyText(r, 503, "MOTOR_TASK_FAILED");  // nothing would stop a lease: never arm
       return;
     }
@@ -702,5 +869,6 @@ void loop() {
     Serial.println("[LIDAR] WARNING: no valid scan after 3 s. Check LD06 power, its TX wire "
                    "to GPIO33 and the motor spinning. /drive answers NO_LIDAR until scans arrive.");
   }
+  logCommandDiagnostics();
   delay(1);  // Lets lower-priority tasks run. The 2048-byte UART buffer covers this.
 }
