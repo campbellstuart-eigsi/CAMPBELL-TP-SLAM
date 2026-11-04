@@ -6,12 +6,14 @@ Current project state only. Keep under ~60 lines; replace outdated items rather 
 The fuller resume briefing is `docs/SESSION_HANDOFF.md`.
 
 ## Progress
-- Branch `feature/ui-redesign` at c65a78e, level with `origin/feature/ui-redesign`; `main` is at
-  bd8b842. The last code commit is e5f1a1d (M1 Stages 0-2).
+- Branch `feature/ui-redesign`: Stage 3 checkpoint **536dba2**, plus a docs commit recording it.
+  Both were pushed to `origin/feature/ui-redesign` on 2026-11-04 with your approval. `main` is at
+  bd8b842; Stages 0-2 are in e5f1a1d.
 - Codes 01-06 work, as do the seven-page desktop app (`00_main_app.py`) and its four-view
   Workspace. M1 Stages 0-2 are committed: the close/resize fix, UI consistency, and the
   bit-identical `workspace_localisation.py` adapter.
-- **M1 Stage 3 is implemented but uncommitted. Gate 3 is NOT yet accepted.** The Workspace
+- **M1 Stage 3 is implemented and checkpointed in 536dba2 ("M1 Stage 3: one-shot localisation
+  implemented, Gate 3 pending"). Gate 3 is NOT yet accepted.** The Workspace
   Localisation group localises one independent scan (04/05/06, global or local) and draws the
   estimate on all three global maps. Report: `results/m1_gate3_20261104_092409/REPORT.md`.
 - LD06 USB capture through ESP32/CH340 on **COM7** at 115200 baud works (user-reported). The
@@ -22,12 +24,12 @@ The fuller resume briefing is `docs/SESSION_HANDOFF.md`.
   runs coincide with the desktop minimising the test window: a bare idle `tk.Tk()` window was
   minimised in 5 of 5 runs. Re-run on an idle desktop.
 - The smoke test has not been re-run since the last `workspace_page.py` edit.
-- Your Gate 3 review and approval of the commit file list.
+- Your Gate 3 review and acceptance.
 
 ## Next steps
 1. On an idle desktop: suite b three times in a row, then the Stage 3 GUI tests, the smoke test
    and the hash check (`docs/SESSION_HANDOFF.md`, "How to resume").
-2. Gate 3 review, then commit with the approved file list.
+2. Gate 3 review and acceptance; commit and push the updated STATUS only with your approval.
 3. Optional: a real COM7 capture localised in the Workspace.
 4. Later (not started): M2 common input layer, M3 ESP32 Wi-Fi, M4 continuous tracking.
 

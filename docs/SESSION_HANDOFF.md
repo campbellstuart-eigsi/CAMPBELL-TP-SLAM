@@ -7,8 +7,9 @@ LiDAR SLAM Workbench (university project): an LD06 LiDAR read through an ESP32 o
 with Tkinter/Matplotlib programs for mapping (Codes 01-03) and localisation (Codes 04-06), plus a
 seven-page desktop app with a four-view Workspace.
 
-**M1 Stage 3 is implemented, but Gate 3 is NOT yet accepted.** The code and tests are written
-and uncommitted. Most verification passed. The GUI suite b has not passed three times in a row,
+**M1 Stage 3 is implemented, but Gate 3 is NOT yet accepted.** The code and tests are
+checkpointed in commit **536dba2** ("M1 Stage 3: one-shot localisation implemented, Gate 3
+pending"), pushed with your approval. Most verification passed. The GUI suite b has not passed three times in a row,
 because the desktop kept minimising the test windows (see "GUI minimisation investigation"). Two
 things are still open: a clean GUI verification on an idle desktop, and your Gate 3 approval.
 
@@ -16,7 +17,8 @@ things are still open: a clean GUI verification on an idle desktop, and your Gat
 - Day 1 mapping (Codes 01-03) and Day 2 localisation (Codes 04-06), up to bd8b842 (`main`).
 - M1 Stage 0 (baseline and the close/resize fix), Stage 1 (UI consistency) and Stage 2
   (`workspace_localisation.py` adapter), committed in e5f1a1d (2026-11-04).
-- M1 Stage 3: implemented and verified as below, **not accepted, not committed**.
+- M1 Stage 3: implemented and verified as below, checkpointed in 536dba2 (pushed), **not
+  accepted**.
 
 ## Work performed this session
 - **Stage 3 implementation**, all in `workspace_page.py` (line ranges in the Gate 3 report):
@@ -73,11 +75,11 @@ things are still open: a clean GUI verification on an idle desktop, and your Gat
   - `scripts/` (the diagnostic and screenshot scripts, copied from the session scratchpad)
   - `backup/` (`results/workspace` and `results/gui_review` before the test runs)
 
-## Exact files modified (uncommitted)
+## Exact files in the Stage 3 checkpoint commit 536dba2
 | File | Change |
 |------|--------|
 | `workspace_page.py` | Stage 3: +425/−12 lines (`git diff --numstat`) |
-| `test_gui_workspace_localisation.py` | new (untracked), 314 lines, 6 GUI tests |
+| `test_gui_workspace_localisation.py` | new, 314 lines, 6 GUI tests |
 | `test_gui_map_display.py` | +11: `collect_closed_app()` and 2 calls (approved) |
 | `test_gui_workspace.py` | +2: calls to `collect_closed_app()` (approved) |
 | `docs/MULTI_VIEW_WORKSPACE.md` | +30/−5: Stage 3 section; wording on estimate vs recorded pose |
@@ -146,7 +148,8 @@ Not verified this session:
 1. Suite b three times in a row, all OK, on an idle desktop.
 2. `test_gui_workspace_localisation` and `gui_smoke_test.py` on the final tree.
 3. The hash check, repeated at the end.
-4. Your Gate 3 review, then approval of the exact commit file list.
+4. Your Gate 3 review and acceptance. Then commit and push the updated STATUS, only with your
+   approval.
 5. Optional, needs your approval to open the port: a real COM7 capture localised in the
    Workspace.
 
@@ -181,11 +184,12 @@ Not verified this session:
 No `docs/decisions/` records exist yet. These decisions live here and in the Gate 3 report.
 
 ## Uncommitted changes and Git status
-- Branch `feature/ui-redesign` at c65a78e, up to date with `origin/feature/ui-redesign`. Nothing
-  is staged and there are no stashes.
-- Modified: `docs/MULTI_VIEW_WORKSPACE.md`, `docs/M1_STAGE3_HANDOFF.md`, `docs/STATUS.md`,
-  `test_gui_map_display.py`, `test_gui_workspace.py`, `workspace_page.py`.
-- Untracked, part of Stage 3: `test_gui_workspace_localisation.py`, `docs/SESSION_HANDOFF.md`.
+- Branch `feature/ui-redesign` at **536dba2** "M1 Stage 3: one-shot localisation implemented,
+  Gate 3 pending" (2026-11-04). It holds exactly the 8 files listed above, on top of c65a78e.
+- A follow-up docs commit records the hash in `docs/STATUS.md` and this file. Both commits were
+  pushed to `origin/feature/ui-redesign` on 2026-11-04 with your approval. `git log --oneline -3`
+  shows the docs commit's own hash.
+- At handoff, nothing was staged, there were no tracked changes, and there were no stashes.
 - Untracked, **leave untracked** (unrelated or generated):
   - `results/` (71 MB of evidence; never tracked)
   - `.idea/` (IDE)
@@ -202,17 +206,11 @@ No `docs/decisions/` records exist yet. These decisions live here and in the Gat
   read-only with `git status`. It was not touched in this session. Leave it alone; none of it
   belongs to this branch.
 
-**Proposed commit (only after Gate 3 is accepted, and with your approval):**
-- Files:
-  - `workspace_page.py`
-  - `test_gui_workspace_localisation.py`
-  - `test_gui_map_display.py`
-  - `test_gui_workspace.py`
-  - `docs/MULTI_VIEW_WORKSPACE.md`
-  - `docs/M1_STAGE3_HANDOFF.md`
-  - `docs/STATUS.md`
-  - `docs/SESSION_HANDOFF.md`
-- Suggested message: "M1 Stage 3: Workspace one-shot localisation of an independent scan".
+**Commit history for Stage 3:**
+- 536dba2 was committed on 2026-11-04 with your approval, as a checkpoint. It does **not** mean
+  Gate 3 is accepted.
+- When Gate 3 passes, the updated Gate 3 report evidence stays in `results/` (untracked). Commit
+  `docs/STATUS.md` and this file with your approval.
 
 ## Suggested spec status changes (awaiting approval)
 None. `docs/specs/` is empty.
@@ -222,8 +220,9 @@ Recommendation only, not an agreed plan: finish and accept Gate 3 (above) before
 After that, M2 (a common input layer for recorded and USB scans), as listed in `docs/STATUS.md`.
 
 ## How to resume
-1. Read `AGENTS.md`, then this file and `docs/STATUS.md`. Run `git status` and confirm that the
-   changes match "Uncommitted changes" above.
+1. Read `AGENTS.md`, then this file and `docs/STATUS.md`. Run `git log --oneline -3` and
+   `git status`. Confirm that HEAD is the docs commit on top of 536dba2 (or a later approved
+   commit), and that the working tree matches "Uncommitted changes and Git status" above.
 2. Setup: Windows, `.\.venv\Scripts\python.exe` (Python 3.13). No hardware is needed for Gate 3.
    Hardware (LD06 → ESP32 → CH340 on COM7, 115200) is needed only for the optional real-capture
    check, and only with your approval.
@@ -242,8 +241,8 @@ After that, M2 (a common input layer for recorded and USB scans), as listed in `
    4. The hash check against `results/m1_gate0_20261104_041714/hashes_before.json`.
 6. If a GUI run fails, run `scripts/diagnose_mapping.py` from the evidence folder to see whether
    the root was `iconic` before treating it as a code defect.
-7. Update the Gate 3 report and `docs/STATUS.md`. Ask for the Gate 3 review and commit approval.
-   Do not stage, commit or push before that. Do not start M2.
+7. Update the Gate 3 report and `docs/STATUS.md`. Ask for the Gate 3 review and acceptance.
+   Do not stage, commit or push without approval. Do not start M2.
 
 ## Confirmed facts vs assumptions
 - **Confirmed** by files, Git and commands seen in this session:
