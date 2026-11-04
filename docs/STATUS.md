@@ -11,17 +11,22 @@ The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP chan
   `docs/decisions/2026-11-04_mvp_http_firmware.md`. Gates: S0 desk → S1 bench → S2 manual
   driving + calibration → S3 drive-stop-scan-localise → S4 frontier exploration → S5 Workspace.
 - **S0 (desk) committed in 6cbefa9:** sketch fixes, `HttpRobotLink`, fake robot, 17 tests.
-- **After S0 (uncommitted, awaiting review):**
-  - Robot controller GUI: `robot_controller.py` (run this), `autonomy/controller_ui.py` (an
-    embeddable `ttk.Frame`), `autonomy/teleop.py` (no-Tk core, all networking on worker
-    threads). SIMULATOR by default (fake robot in a simulated room); REAL ROBOT needs the bench
-    checks ticked before ARM. AZERTY default (Z/S, Q/D, A/E, Space); layouts configurable;
-    300 ms leases; key release, focus loss and link loss clear intent; no command queue.
-  - Firmware safety fix: `/arm` keeps the command seq, so a `/drive` delayed from before a STOP
-    is refused after the next ARM (link and fake updated to match).
-  - Upload package `firmware/ESP32SlamRobot/`: `wifi_secrets.h` (untracked, compile-time
-    checks), `README.md`, `DEPENDENCIES.md`, `compile_check.py`.
-  - S1 bench test paused: no access to the robot yet.
+- **Committed in 221c778:** robot controller GUI (`robot_controller.py`), teleop core, upload
+  package, `/arm` keeps the command seq.
+- **S1 (2026-11-04, user):** upload OK, then a reboot loop (`rst:0xc SW_CPU_RESET`), the AP
+  never appeared, and one wheel spun before and after the upload. Controller not connected.
+- **After S1 (uncommitted, awaiting review): diagnostic firmware** (COMPILE-VERIFIED /
+  HARDWARE-UNTESTED). Investigation: `docs/research/2026-11-04_s1_reboot_investigation.md`.
+  - Likely cause (code evidence, unconfirmed): the sketch shortened the shared task watchdog to
+    1 s, but AsyncTCP's task sleeps up to 1.25 s between resets. Brownout is the alternative;
+    the serial log decides.
+  - Fix: the core's 5 s shared watchdog, plus a 300 ms motor-task stall check. `[BOOT]`
+    checkpoints, reset reason, reset-loop count, motor I²C ACK at boot. `MOTORS_LOCKED 1`:
+    `/arm` refused.
+  - `test_firmware_static.py` (6 checks; fails on 221c778 as intended).
+- **Hardware facts:** the I²C motor controller type is confirmed (user, from the professor).
+  Address 0x30, GPIO19/21 and the register map come from the library code only, **not
+  checked on the robot**.
 - **Phase B approach A preserved:** steps 1-2c in 364982a on `feature/autonomy-simulator`
   (protocol v2, firmware model, `ProtocolRobotLink`, simulated Wi-Fi). Step 3 is parked:
   untracked, uncompiled `firmware/autonomy_robot/src/crc.*` and `protocol.*` (v2). The old v1
@@ -30,13 +35,20 @@ The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP chan
   continues on `feature/ui-redesign` (`C:\Users\stuar\Desktop\SLAM`).
 
 ## Next steps
-1. Your review of the controller and the upload package; a commit only with your approval.
-2. S1 bench test when the robot is available (`firmware/ESP32SlamRobot/README.md`, section 7).
-3. S2 calibration, then S3-S5 (not started).
+1. Your review of the diagnostic firmware; a commit only with your approval.
+2. Next offline milestone (proposed): a headless live-localisation tracker (Code 04 on
+   simulated scan sequences, measured against simulated truth), then the Live Localisation and
+   Live Exploration workspaces.
+3. At the robot: S1a with the diagnostic build (README section 7); S1b only after the cut-off
+   and reset checks pass.
 
 ## Issues and safety blockers
-- **Unknown, blocks floor tests:** does the motor board hold its last PWM when the ESP32 resets
-  or hangs? S1 step 6 observes it.
+- **Blocks all movement:**
+  - a wheel spun at S1 without any command from this firmware (cause unknown);
+  - whether the controller holds PWM across ESP32 resets is unknown;
+  - a physical motor cut-off must be verified first.
+
+  Code cannot prove that motor power is off.
 - **No encoders:** `move()` refuses until a `Calibration` measured at S2 is given.
 - **Late HTTP:** a `/drive` delayed in TCP can still start a lease late (300 ms from the
   controller, at most 1 s from the firmware); after STOP it is refused (DISARMED, or STALE after
@@ -60,7 +72,9 @@ The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP chan
 | `.\.venv\Scripts\python.exe -m unittest test_gui_robot_controller -v` | 12 OK (18 s) |
 | `.\.venv\Scripts\python.exe -m unittest test_gui_map_display test_gui_workspace -v` | 12 OK (78 s), one run |
 | `.\.venv\Scripts\python.exe gui_smoke_test.py` | PASS |
-| `python firmware\ESP32SlamRobot\compile_check.py --ld06-zip … --mecanum-zip … --libraries <scratch>` | PASSED: no secrets → `#error`; example password → `static_assert`; test password → 947,180 B flash (72 %), 93,952 B RAM (28 %) |
+| `compile_check.py` on the 221c778 build | PASSED (947,180 B flash, 72 %) |
+| `python firmware\ESP32SlamRobot\compile_check.py --ld06-zip … --mecanum-zip … --libraries <scratch>` on the diagnostic build (from the worktree, after restoring `wifi_secrets.example.h`) | PASSED: no secrets → `#error`; example password → `static_assert`; test password → 950,032 B flash (72 %), 93,992 B RAM (28 %). `--warnings all`: only the known `ld06.cpp` warning |
+| `-m unittest test_firmware_static test_autonomy_http test_autonomy_teleop test_autonomy_protocol test_autonomy_link test_autonomy_wifi` (after the diagnostic changes) | 153 OK |
 
 ## Untested / unverified
 - **Firmware: COMPILE-VERIFIED / HARDWARE-UNTESTED.** Never run on the robot: watchdog, leases,

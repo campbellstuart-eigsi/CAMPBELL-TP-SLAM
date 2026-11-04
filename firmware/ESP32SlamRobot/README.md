@@ -1,8 +1,12 @@
 # ESP32SlamRobot: Arduino upload package
 
-**Status: COMPILE-VERIFIED / HARDWARE-UNTESTED.** It compiles for the ESP32 Dev Module with the
-exact dependencies below. It has **never run on the robot**: the watchdog, leases, stops and
-wheel directions are unverified until the S1 bench test.
+**Status: COMPILE-VERIFIED / HARDWARE-UNTESTED, DIAGNOSTIC BUILD (`MOTORS_LOCKED 1`).**
+- It compiles for the ESP32 Dev Module with the exact dependencies below.
+- The build uploaded at S1 (221c778) **reboot-looped** (`rst:0xc`). The likely cause, a task
+  watchdog conflict with AsyncTCP, is fixed in this build but unconfirmed on hardware. See
+  `docs/research/2026-11-04_s1_reboot_investigation.md`.
+- This build **cannot arm**: `/arm` answers 423 `MOTORS_LOCKED`, so no route moves a wheel.
+- It prints numbered `[BOOT]` checkpoints and the reset reason (section 4b).
 
 Firmware for the MecanumCarV2 robot (ESP32-WROOM-32, LD06 LiDAR): a Wi-Fi access point with
 HTTP routes. Python drives it with `autonomy/http_robot_link.py` and the controller
@@ -81,6 +85,29 @@ password fails, and a test password compiles.
 3. Sketch > Upload. If it waits on "Connecting…", hold the BOOT button until writing starts.
 4. Tools > Serial Monitor at 115200: it prints `AP IP: 192.168.4.1`.
 
+## 4b. Expected serial output (115200 baud) and reset loops
+A healthy boot prints, once:
+```
+=== ESP32SlamRobot: COMPILE-VERIFIED, HARDWARE-UNTESTED ===
+[BOOT] reset reason: POWERON (power applied)
+[BOOT ...ms] 1 motors zeroed: zero PWM written; the motor board ACKed
+[BOOT ...ms] 2 serial up: Serial 115200 baud
+[BOOT ...ms] 3 motor task started: 10 ms motor task on core 1; stall check 300 ms; task watchdog 5 s
+[BOOT ...ms] 4 LiDAR UART started: Serial2 230400 baud, RX GPIO33, PWM GPIO32 HIGH; ...
+[BOOT ...ms] 5 Wi-Fi AP started: SSID "<your SSID>", IP 192.168.4.1, channel 6
+AP IP: 192.168.4.1
+[BOOT ...ms] 6 HTTP server started: port 80 (starts the async_tcp task)
+[BOOT ...ms] 7 setup complete: robot DISARMED; MOTORS_LOCKED build: /arm is refused
+[BOOT ...ms] 8 running: first LiDAR scan: N points, D deg/s
+```
+- **A reset loop:** `rst:` lines keep repeating, and `boot N since power-on` climbs (the
+  `RESET LOOP` warning appears from boot 3). Copy the lines **just before** each `rst:`, plus
+  the next boot's `reset reason` and `previous boot reached checkpoint`. The investigation
+  note's section 5 explains them: BROWNOUT means power, TASK_WDT names a task, PANIC means a
+  crash with a backtrace.
+- **`motor board did NOT ACK`:** stop and cut motor power. The zero writes may not reach the
+  controller.
+
 ## 5. Wiring reference (from the course sketch; check it on your robot)
 | Signal | ESP32 GPIO | Notes |
 |---|---|---|
@@ -110,8 +137,18 @@ rear-right 5/6 (from `MecanumCar_v2.cpp`; which motor is physically "front" is u
   number is kept across `/arm`, so a delayed command from before a STOP is refused.
 
 ## 7. S1 bench checklist (you flash; wheels in the air; hand on the power cut-off)
-Read `/status` throughout, or use `robot_controller.py` in REAL ROBOT mode. Each step must stop
-the wheels.
+**S1a, with this diagnostic build (`MOTORS_LOCKED 1`), motor power off if you can:**
+1. A clean boot log (section 4b), with no reset loop over 2 minutes.
+2. The phone or laptop sees the SSID and joins it. `http://192.168.4.1/status` answers, with
+   `boot_count` 1, `motor_ack` 1 and `motors_locked` 1.
+3. `/scan2` returns scans (`robot_controller.py` REAL ROBOT preview), and `/arm` answers
+   `MOTORS_LOCKED`.
+4. The wheel incident (separate gate): verify the physical cut-off stops a spinning wheel.
+   Observe whether the controller holds PWM across an ESP32 reset. **Only then** rebuild with
+   `MOTORS_LOCKED 0` for S1b.
+
+**S1b, with `MOTORS_LOCKED 0`, only after S1a passes.** Read `/status` throughout, or use
+`robot_controller.py` in REAL ROBOT mode. Each step must stop the wheels.
 1. Boot: the wheels stay still; `/status` shows `armed:0`.
 2. `/arm`, then `/drive?vx=30&time=500&seq=1`: the wheels turn about 0.5 s, then stop alone.
 3. A longer `/drive` (time=1000), then `/stop` mid-move: they stop at once; `armed:0`.
@@ -131,3 +168,11 @@ the wheels.
 3. `/arm` no longer resets the command sequence number. A `/drive` delayed from before a STOP
    would otherwise be accepted after the next ARM.
 4. The Wi-Fi name and password moved to `wifi_secrets.h`, with compile-time checks.
+5. **After S1 (diagnostic build):**
+   - the shared task watchdog is no longer shortened to 1 s (it conflicted with AsyncTCP);
+   - a 300 ms motor-task stall check replaces it;
+   - `[BOOT]` checkpoints, reset reasons and reset-loop detection;
+   - the motor I²C ACK is checked at boot;
+   - `/arm` is refused if the motor task is missing, or while `MOTORS_LOCKED` is 1.
+
+   The S1 build is in Git: `git show 221c778:firmware/ESP32SlamRobot/ESP32SlamRobot.ino`.

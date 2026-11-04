@@ -3,5 +3,8 @@
 ld06.h
 ld06.cpp
 ld06crc.h
+# MecanumCar_v2 copied into the sketch folder: no licence, never commit it.
+MecanumCar_v2.cpp
+MecanumCar_v2.h
 # The robot's real Wi-Fi name and password (copy of wifi_secrets.example.h).
 wifi_secrets.h

@@ -7,7 +7,10 @@
 //          motor stop on Wi-Fi client loss, optional LiDAR stop zones,
 //          a task watchdog on the motor task (a hung task reboots the ESP32,
 //          and setup() stops the motors first), Wi-Fi name and password in the
-//          untracked wifi_secrets.h, the command seq kept across /arm.
+//          untracked wifi_secrets.h, the command seq kept across /arm,
+//          boot diagnostics ([BOOT] checkpoints, reset reason, reset-loop count)
+//          and a 300 ms motor-task stall check (the shared task watchdog keeps
+//          the core's 5 s, which AsyncTCP needs).
 //
 // Put ld06.h, ld06.cpp and ld06crc.h in this sketch folder (as in the course
 // sketch) and install the MecanumCar_v2, AsyncTCP and ESPAsyncWebServer libraries.
@@ -55,7 +58,16 @@ const uint32_t MAX_MOVE_MS = 1000;     // Longest lease of any move. The course 
 const uint32_t SETTLE_MS = 300;        // Scan counts as still this long after motors stop.
 const uint32_t LIDAR_STALE_MS = 500;   // No scan for this long: moves stop and are refused.
 const bool     I2C_NACK_IS_FAULT = false;  // Set true once /status shows i2c_nacks stays 0.
-const uint32_t TASK_WDT_MS = 1000;     // Motor task or loop() silent this long: reboot.
+// Motor task silent this long: loop() reboots the ESP32 (setup() then stops the
+// motors first). This is the fast motor check. The shared task watchdog keeps the
+// core's 5 s: AsyncTCP's own task sleeps up to 5000 / 4 = 1250 ms between watchdog
+// resets, so a shorter shared timeout (the earlier 1000 ms) reboots it in a loop.
+const uint32_t MOTOR_STALL_MS = 300;
+const uint32_t LIDAR_FIRST_SCAN_WARN_MS = 3000;  // boot log warns if no scan by then
+// DIAGNOSTIC BUILD: 1 = the motors can never be armed (/arm answers 423
+// MOTORS_LOCKED), so no route can move a wheel. Zero-PWM writes still run.
+// Set to 0 only after the S1 cut-off and stopping checks have passed.
+#define MOTORS_LOCKED 1
 
 // Keep false until the LiDAR front direction and body mask have been measured.
 const bool     GUARD_ENABLED = false;
@@ -102,6 +114,47 @@ uint32_t lastCommandSeq = 0;
 uint32_t i2cNacks = 0;
 uint32_t guardTrips = 0;
 uint32_t bootId = 0;
+
+// ------------------------------------------------------------
+// BOOT DIAGNOSTICS (serial log; survive a software reset in RTC memory)
+// ------------------------------------------------------------
+const uint32_t DIAG_MAGIC = 0x534C414D;  // "SLAM": RTC values below are valid
+RTC_NOINIT_ATTR uint32_t diagMagic;
+RTC_NOINIT_ATTR uint32_t diagBootCount;   // boots since power-on
+RTC_NOINIT_ATTR uint32_t diagCheckpoint;  // last checkpoint reached by the previous boot
+RTC_NOINIT_ATTR uint32_t diagOwnRestart;  // 1 = the previous boot rebooted itself (motor stall)
+volatile uint32_t motorHeartbeatMs = 0;   // written by the motor task every cycle
+bool motorStopAcked = false;              // the motor board ACKed the zero-PWM write at boot
+bool motorTaskOk = false;                 // /arm is refused without the motor task
+bool wifiStarted = false;
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "POWERON (power applied)";
+    case ESP_RST_EXT:       return "EXT (reset pin)";
+    case ESP_RST_SW:        return "SW (esp_restart)";
+    case ESP_RST_PANIC:     return "PANIC (crash or abort: read the backtrace above)";
+    case ESP_RST_INT_WDT:   return "INT_WDT (interrupt watchdog)";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT (task watchdog: a task did not reset it)";
+    case ESP_RST_WDT:       return "WDT (other watchdog)";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (supply voltage dropped: check battery and motors)";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
+const char* CHECKPOINT_NAMES[] = {
+  "none", "motors zeroed", "serial up", "motor task started", "LiDAR UART started",
+  "Wi-Fi AP started", "HTTP server started", "setup complete", "running"};
+
+// One line per startup step, flushed, and remembered across a software reset.
+void checkpoint(uint32_t step, const char* detail) {
+  diagCheckpoint = step;
+  Serial.printf("[BOOT %lu ms] %lu %s: %s\n", (unsigned long)millis(), (unsigned long)step,
+                CHECKPOINT_NAMES[step], detail);
+  Serial.flush();
+}
 
 uint32_t scanSeq = 0;
 uint32_t scanEndMs = 0;
@@ -224,10 +277,12 @@ void motorStep() {
 }
 
 void motorTask(void*) {
-  esp_task_wdt_add(nullptr);  // A hang here (e.g. inside the I2C writes) reboots the ESP32.
+  // Backstop: the shared task watchdog (5 s). The fast check is MOTOR_STALL_MS in loop().
+  esp_task_wdt_add(nullptr);
   TickType_t wake = xTaskGetTickCount();
   for (;;) {
     esp_task_wdt_reset();
+    motorHeartbeatMs = millis();   // loop() reboots if this stops for MOTOR_STALL_MS
     motorStep();
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(10));
   }
@@ -449,14 +504,16 @@ void sendStatus(AsyncWebServerRequest* req) {
   for (int i = 0; i < 8; ++i) sectors[i] = sectorMinMm[i];
   portEXIT_CRITICAL(&stateMux);
 
-  char json[560];
+  char json[640];
   snprintf(json, sizeof(json),
-           "{\"boot_id\":%lu,\"uptime_ms\":%lu,\"reset_reason\":%d,\"armed\":%d,\"fault\":%d,"
+           "{\"boot_id\":%lu,\"uptime_ms\":%lu,\"reset_reason\":%d,\"boot_count\":%lu,"
+           "\"motor_ack\":%d,\"motors_locked\":%d,\"armed\":%d,\"fault\":%d,"
            "\"moving\":%d,\"lease_ms\":%lu,\"cmd_seq\":%lu,\"scan_seq\":%lu,\"scan_age_ms\":%lu,"
            "\"scan_points\":%u,\"lidar_dps\":%u,\"crc_fails\":%u,\"oversize_scans\":%lu,"
            "\"i2c_nacks\":%lu,\"guard_on\":%d,\"guard_trips\":%lu,"
            "\"sector_mm\":[%u,%u,%u,%u,%u,%u,%u,%u],\"clients\":%d,\"free_heap\":%lu}",
-           (unsigned long)bootId, (unsigned long)now, (int)esp_reset_reason(), armedNow, faultNow,
+           (unsigned long)bootId, (unsigned long)now, (int)esp_reset_reason(),
+           (unsigned long)diagBootCount, motorStopAcked, MOTORS_LOCKED, armedNow, faultNow,
            movingNow, (unsigned long)remaining, (unsigned long)cmdSeq, (unsigned long)seq,
            (unsigned long)age, points, speed, lidar.getChecksumFailCount(),
            (unsigned long)oversize, (unsigned long)nacks, GUARD_ENABLED, (unsigned long)trips,
@@ -473,6 +530,8 @@ void sendStatus(AsyncWebServerRequest* req) {
 void setup() {
   // First action: the board keeps its last PWM values across an ESP32 reset.
   car.Stop();
+  const int16_t zero[4] = {0, 0, 0, 0};
+  motorStopAcked = writeWheels(zero);  // the same zeros again, with the ACK bits checked
 
   Serial.begin(115200);
   delay(200);
@@ -482,26 +541,63 @@ void setup() {
     sectorNear[i] = 0;
   }
 
-  // Task watchdog: TASK_WDT_MS instead of the default 5 s, and a panic (reboot)
-  // on expiry. Idle tasks are not watched; only the motor task and loop() are.
-  const esp_task_wdt_config_t wdtConfig = {TASK_WDT_MS, 0, true};
-  if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE) esp_task_wdt_init(&wdtConfig);
+  // Why the previous boot ended. The ROM line "rst:0xc (SW_CPU_RESET)" is the same
+  // for a panic, a task watchdog, a brownout and esp_restart(); this tells them apart.
+  const esp_reset_reason_t reason = esp_reset_reason();
+  const bool rtcValid = diagMagic == DIAG_MAGIC && reason != ESP_RST_POWERON;
+  const uint32_t previousCheckpoint = rtcValid ? diagCheckpoint : 0;
+  const bool previousOwnRestart = rtcValid && diagOwnRestart == 1;
+  if (!rtcValid) {
+    diagMagic = DIAG_MAGIC;
+    diagBootCount = 0;
+  }
+  diagBootCount++;
+  diagCheckpoint = 0;
+  diagOwnRestart = 0;
+  Serial.println();
+  Serial.println("=== ESP32SlamRobot: COMPILE-VERIFIED, HARDWARE-UNTESTED ===");
+  Serial.printf("[BOOT] reset reason: %s\n", resetReasonName(reason));
+  if (rtcValid) {
+    Serial.printf("[BOOT] boot %lu since power-on; the previous boot reached checkpoint %lu (%s)\n",
+                  (unsigned long)diagBootCount, (unsigned long)previousCheckpoint,
+                  CHECKPOINT_NAMES[previousCheckpoint < 9 ? previousCheckpoint : 0]);
+  }
+  if (previousOwnRestart) Serial.println("[BOOT] the previous boot rebooted itself: motor task stalled");
+  if (diagBootCount >= 3) {
+    Serial.println("[BOOT] WARNING: 3+ boots without a power cycle = RESET LOOP. Copy the lines "
+                   "printed just before 'rst:' (panic, task_wdt or Brownout).");
+  }
+  checkpoint(1, motorStopAcked ? "zero PWM written; the motor board ACKed"
+                               : "zero PWM written; the motor board did NOT ACK: the motors may "
+                                 "not be stopped - cut motor power");
+  checkpoint(2, "Serial 115200 baud");
 
   // Priority above loop(), so a stalled loop() cannot delay a lease expiry.
-  xTaskCreatePinnedToCore(motorTask, "motor", 4096, nullptr, 3, nullptr, 1);
+  motorTaskOk =
+      xTaskCreatePinnedToCore(motorTask, "motor", 4096, nullptr, 3, nullptr, 1) == pdPASS;
+  checkpoint(3, motorTaskOk ? "10 ms motor task on core 1; stall check 300 ms; task watchdog 5 s"
+                            : "FAILED to create the motor task: staying DISARMED");
 
   // LIDAR UART
   Serial2.setRxBufferSize(2048);  // About 115 ms of LD06 data.
   Serial2.begin(LIDAR_BAUD, SERIAL_8N1, RX_LIDAR, TX_LIDAR);
   Serial2.setTimeout(2);
-  lidar.init();  // Sets the LiDAR PWM input on GPIO32 HIGH.
+  lidar.init();  // Sets the LiDAR PWM input on GPIO32 HIGH (keeps RX on GPIO33).
+  checkpoint(4, "Serial2 230400 baud, RX GPIO33, PWM GPIO32 HIGH; first scan reported below");
 
   // WIFI AP
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ROBOT_SSID, ROBOT_PASSWORD, WIFI_CHANNEL);
+  wifiStarted = WiFi.mode(WIFI_AP) && WiFi.softAP(ROBOT_SSID, ROBOT_PASSWORD, WIFI_CHANNEL);
   WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) { disarmAndStop(); },
                ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
   delay(200);
+  if (wifiStarted) {
+    char detail[96];
+    snprintf(detail, sizeof(detail), "SSID \"%s\", IP %s, channel %d", ROBOT_SSID,
+             WiFi.softAPIP().toString().c_str(), WIFI_CHANNEL);
+    checkpoint(5, detail);
+  } else {
+    checkpoint(5, "FAILED: no access point; the robot stays DISARMED (no HTTP control)");
+  }
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
@@ -539,6 +635,14 @@ void setup() {
 
   // ADDED ROUTES
   server.on("/arm", HTTP_GET, [](AsyncWebServerRequest* r) {
+#if MOTORS_LOCKED
+    replyText(r, 423, "MOTORS_LOCKED");  // diagnostic build: movement disabled
+    return;
+#endif
+    if (!motorTaskOk) {
+      replyText(r, 503, "MOTOR_TASK_FAILED");  // nothing would stop a lease: never arm
+      return;
+    }
     portENTER_CRITICAL(&stateMux);
     endMoveLocked(millis());
     fault = false;
@@ -562,13 +666,41 @@ void setup() {
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest* r) { sendStatus(r); });
 
   server.begin();
-  enableLoopWDT();  // Restarts the ESP32 if loop() hangs.
+  checkpoint(6, "port 80 (starts the async_tcp task)");
+  enableLoopWDT();  // Restarts the ESP32 if loop() hangs (shared task watchdog, 5 s).
+  checkpoint(7, MOTORS_LOCKED ? "robot DISARMED; MOTORS_LOCKED build: /arm is refused"
+                              : "robot DISARMED; waiting for /arm");
 }
 
 // ------------------------------------------------------------
 // LOOP
 // ------------------------------------------------------------
 void loop() {
+  // Fast motor check: read the heartbeat BEFORE the clock, so the age never underflows.
+  const uint32_t beat = motorHeartbeatMs;
+  const uint32_t now = millis();
+  if (beat != 0 && now - beat > MOTOR_STALL_MS) {
+    Serial.printf("[FATAL] motor task silent for %lu ms: rebooting (setup() zeroes the motors "
+                  "first)\n", (unsigned long)(now - beat));
+    diagOwnRestart = 1;
+    Serial.flush();
+    esp_restart();
+  }
+
   if (lidar.readScan()) publishScan();
+
+  static bool lidarReported = false;
+  static bool lidarWarned = false;
+  if (!lidarReported && scanSeq > 0) {
+    lidarReported = true;
+    char detail[64];
+    snprintf(detail, sizeof(detail), "first LiDAR scan: %u points, %u deg/s", scanPoints,
+             lidarSpeedDps);
+    checkpoint(8, detail);
+  } else if (!lidarReported && !lidarWarned && now > LIDAR_FIRST_SCAN_WARN_MS) {
+    lidarWarned = true;
+    Serial.println("[LIDAR] WARNING: no valid scan after 3 s. Check LD06 power, its TX wire "
+                   "to GPIO33 and the motor spinning. /drive answers NO_LIDAR until scans arrive.");
+  }
   delay(1);  // Lets lower-priority tasks run. The 2048-byte UART buffer covers this.
 }

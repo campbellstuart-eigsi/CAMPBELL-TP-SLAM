@@ -1,6 +1,71 @@
 # Session handoff
 
-_Last updated: 2026-11-04_ · _Session focus: Phase B autonomy, steps 1-2c (protocol, firmware model, RobotLink, simulated Wi-Fi) and the original robot files_
+_Last updated: 2026-11-04_ · _Current branch: `feature/http-robot-mvp` (approach B, HTTP MVP). The
+sections from "Project overview" down are the earlier Phase B handoff (approach A,
+`feature/autonomy-simulator`), kept unchanged._
+
+## Current state: HTTP robot MVP (`feature/http-robot-mvp`)
+**Where:** worktree `C:\Users\stuar\Desktop\SLAM-autonomy`. Python is
+`C:\Users\stuar\Desktop\SLAM\.venv\Scripts\python.exe`, used as an interpreter only.
+
+**Commits on this branch (on top of b48037a):**
+- 6cbefa9 S0: sketch, `HttpRobotLink`, fake robot.
+- 221c778 controller GUI (`robot_controller.py`), teleop core, upload package.
+- The diagnostic-firmware commit that follows it (see `git log`).
+
+**S1 hardware session (user-reported):**
+- Upload OK, then a reboot loop (`rst:0xc SW_CPU_RESET`). The AP never appeared.
+- One wheel spun before and after the upload, then stopped.
+- The controller was never connected.
+
+**Diagnostic firmware (COMPILE-VERIFIED / HARDWARE-UNTESTED):**
+`firmware/ESP32SlamRobot/ESP32SlamRobot.ino`. Investigation:
+`docs/research/2026-11-04_s1_reboot_investigation.md`.
+- Likely cause (code evidence, unconfirmed): the S0 sketch shortened the **shared** task
+  watchdog to 1 s, while AsyncTCP's task sleeps up to 1.25 s between resets. Brownout is the
+  alternative; the serial log decides.
+- Changes:
+  - the core's 5 s shared watchdog, plus a 300 ms motor-task stall check that reboots;
+  - `[BOOT]` checkpoints and reset reason, with the previous boot's last checkpoint kept in
+    RTC memory and a reset-loop count;
+  - the motor I²C ACK checked at boot;
+  - `/arm` refused without the motor task;
+  - **`MOTORS_LOCKED 1`** (`/arm` answers 423).
+- Verified:
+  - `compile_check.py` PASSED (950,032 B flash, 72 %);
+  - `test_firmware_static.py` 6 OK (it fails on 221c778);
+  - autonomy suites 153 OK.
+
+**Hardware facts vs assumptions:**
+- Confirmed: an I²C motor controller (user, from the professor).
+- From library code only: 0x30, SDA 19 / SCL 21, registers 1-8.
+- Unknown: the controller's behaviour on an ESP32 reset, the cause of the S1 wheel spin, and
+  any physical motor cut-off.
+
+**Outstanding hardware risks (block all movement):**
+1. A wheel spun without any command from this firmware.
+2. Whether the controller holds PWM across resets is unknown.
+3. A physical motor cut-off must be verified to stop a spinning wheel.
+
+Code cannot prove that motor power is off. Keep `MOTORS_LOCKED 1` until S1a (firmware README,
+section 7) passes.
+
+**Local files never committed** (all in `.gitignore`):
+- `firmware/ESP32SlamRobot/wifi_secrets.h` (credentials);
+- `ld06.*` (licence unconfirmed);
+- `MecanumCar_v2.*` (no licence).
+
+Also untracked: `results/`, `__pycache__/`, and the parked approach-A C++
+`firmware/autonomy_robot/`.
+
+**Next software milestone:** headless live-localisation tracking on simulated LiDAR (Code 04
+local search seeded by the previous pose, global recovery, error against simulated truth).
+Then the Live Localisation and Live Exploration workspaces.
+
+**At the robot next time:**
+1. S1a with the diagnostic build: boot log, AP, `/status`, `/scan2`, `/arm` refused.
+2. The cut-off and reset-hold checks.
+3. Only then S1b with `MOTORS_LOCKED 0`.
 
 ## Project overview and current state
 - **The project:** LiDAR SLAM Workbench (EIGSI TP), an LD06 LiDAR on an ESP32-WROOM-32 Mecanum
