@@ -18,7 +18,8 @@ diagnostic firmware, headless live-localisation tracker_
   - The robot boots and its Wi-Fi works with the diagnostic firmware (user-reported).
   - The controller has **not** moved the robot. The firmware is built with `MOTORS_LOCKED 1`
     on purpose, until an unexplained wheel spin and the motor cut-off are checked.
-  - The latest work (controller simplification and motor diagnostics) is **uncommitted**.
+  - The latest work (controller simplification and motor diagnostics) is committed and pushed
+    (23b0506).
 
 ## Completed milestones
 - Phase B approach A, steps 1-2c: protocol v2, firmware model, `ProtocolRobotLink`, simulated
@@ -40,7 +41,7 @@ diagnostic firmware, headless live-localisation tracker_
 All four approach-B commits are pushed to `origin/feature/http-robot-mvp`.
 
 ## Work performed this session
-**Firmware** (`firmware/ESP32SlamRobot/ESP32SlamRobot.ino`, uncommitted, COMPILE-VERIFIED /
+**Firmware** (`firmware/ESP32SlamRobot/ESP32SlamRobot.ino`, 23b0506, COMPILE-VERIFIED /
 HARDWARE-UNTESTED):
 - I²C ACK sampled with `INPUT_PULLUP` (`recvAckPulled`). The library's floating read could
   report a missing controller as an ACK.
@@ -56,7 +57,7 @@ HARDWARE-UNTESTED):
 - `MOTORS_LOCKED 1` (the user's working copy had been set to 0; set back to 1 at the user's
   request for these diagnostics).
 
-**Controller** (uncommitted). Decision `docs/decisions/2026-11-04_simplified_controller_auto_arm.md`:
+**Controller** (23b0506). Decision `docs/decisions/2026-11-04_simplified_controller_auto_arm.md`:
 - `autonomy/teleop.py`:
   - automatic `/arm` on the first new key press while stopped;
   - keys held through a STOP must be released before driving again;
@@ -145,16 +146,12 @@ Not verified this session:
 - Earlier records: SoftAP/UDP, CCW angles, Mecanum I²C driver, LD06 library reuse, interim motion
   limits (`docs/decisions/`).
 
-## Uncommitted changes and Git status
-- HEAD 2cdd3e3 = `origin/feature/http-robot-mvp`.
-- **Modified:**
-  - `autonomy/controller_ui.py`, `fake_http_robot.py`, `http_robot_link.py`, `teleop.py`;
-  - `docs/STATUS.md`, `docs/SESSION_HANDOFF.md`;
-  - `firmware/ESP32SlamRobot/ESP32SlamRobot.ino`, `README.md`;
-  - `robot_controller.py`;
-  - `test_autonomy_http.py`, `test_autonomy_teleop.py`, `test_firmware_static.py`,
-    `test_gui_robot_controller.py`.
-- **New:** `docs/decisions/2026-11-04_simplified_controller_auto_arm.md`.
+## Git status
+- This session's work is committed and pushed: **23b0506** "Simplified controller (connect,
+  drive, stop) with automatic arming; firmware motor/I2C diagnostics (motors locked)" (14
+  files), followed by a docs-only commit that brings this file and `docs/STATUS.md` up to date.
+  HEAD = `origin/feature/http-robot-mvp`.
+- No tracked changes remain.
 - **Untracked, leave out of commits:** `results/`, `__pycache__/`, `autonomy/__pycache__/`,
   `firmware/autonomy_robot/` (parked approach-A C++).
 - **Ignored local files:** `wifi_secrets.h`, `ld06.*`, `MecanumCar_v2.*`.

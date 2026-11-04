@@ -13,10 +13,11 @@ The fuller briefing is `docs/SESSION_HANDOFF.md`.
   - 6cbefa9: S0 firmware and `HttpRobotLink`;
   - 221c778: controller and upload package;
   - 275782b: diagnostic firmware after the S1 reboot loop;
-  - 2cdd3e3: headless live-localisation tracker.
+  - 2cdd3e3: headless live-localisation tracker;
+  - 23b0506: simplified controller and firmware motor diagnostics (below).
 - **At the robot (user-reported):** S1 reboot loop, then (with the diagnostic build) Wi-Fi works.
   The controller has not moved the robot.
-- **Uncommitted:**
+- **Latest (23b0506):**
   - Firmware motor diagnostics: I²C ACK read with a pull-up; write-free 0x30/0x31 probe;
     `/status` and serial report refusals, move ends, applied PWM and I²C counters.
     `MOTORS_LOCKED 1`.
@@ -25,15 +26,14 @@ The fuller briefing is `docs/SESSION_HANDOFF.md`.
   - The controller shows the firmware's exact refusal reasons.
 
 ## Next steps
-1. Your review; commit and push only with your approval.
-2. At the robot, still locked:
+1. At the robot, still locked:
    - boot log and `[I2C] VERDICT`;
    - `/status` (`i2c_ack_0x30`, `i2c_nacks`, `scan_age_ms`);
    - the controller shows `cannot drive: MOTORS_LOCKED`.
 
    Firmware README section 7 (S1a-motor).
-3. Physical gate, then `MOTORS_LOCKED 0` and S1b (wheels in the air).
-4. Software: tracker on the real classroom map, then the Live Localisation workspace.
+2. Physical gate, then `MOTORS_LOCKED 0` and S1b (wheels in the air).
+3. Software: tracker on the real classroom map, then the Live Localisation workspace.
 
 ## Issues and safety blockers
 - **Blocks all movement:**
@@ -58,7 +58,7 @@ The fuller briefing is `docs/SESSION_HANDOFF.md`.
   modified.
 - No flashing, COM port or motor activation by Claude.
 
-## Verified tests (2026-11-04, this worktree, uncommitted tree)
+## Verified tests (2026-11-04, this worktree, tree committed as 23b0506)
 | Command | Result |
 |---------|--------|
 | `python firmware\ESP32SlamRobot\compile_check.py --ld06-zip … --mecanum-zip … --libraries <scratch>` | PASSED: 952,240 B flash (72 %), 94,056 B RAM (28 %); no-secrets and example-password builds refused |
