@@ -11,7 +11,7 @@ Python 3.13, Tkinter, Matplotlib, NumPy, pyserial (tests also use Pillow). Hardw
 ## Commands
 - Install: `<TBD>` (no requirements file in the project; uses `.venv`)
 - Run: `.\.venv\Scripts\python.exe 00_main_app.py`
-- Test: `.\.venv\Scripts\python.exe -m unittest 01_lidar_visualizer 02_grid_mapping 03_vector_mapping localisation_common 04_grid_localisation 05_vector_localisation 06_scan_localisation test_application test_diagnose_lidar_serial test_workspace test_ui_theme test_workspace_localisation -v`; GUI: `... -m unittest test_gui_map_display test_gui_workspace -v`; smoke: `... gui_smoke_test.py`
+- Test: `.\.venv\Scripts\python.exe -m unittest 01_lidar_visualizer 02_grid_mapping 03_vector_mapping localisation_common 04_grid_localisation 05_vector_localisation 06_scan_localisation test_application test_diagnose_lidar_serial test_workspace test_ui_theme test_workspace_localisation test_robot_drive -v`; GUI: `... -m unittest test_gui_map_display test_gui_workspace test_gui_workspace_drive -v`; smoke: `... gui_smoke_test.py`
 - Lint/format: `<TBD>`
 
 ## Conventions

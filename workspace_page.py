@@ -21,6 +21,7 @@ from desktop_app import (Page, GridPage, PoseInputs, VectorLocalisationPage, Sca
                          field_label, heading, note, row, tip, set_text, show_verdict_chip)
 from ui_fonts import FontSet, TechnicalLabel
 from ui_theme import PLOT, THEME
+import robot_drive
 import workspace_localisation as wl
 from workspace_inputs import ScanFrame
 
@@ -322,6 +323,7 @@ class WorkspacePage(Page):
 
         capture = heading(self.controls, "Capture (LD06)")
         self.capture_controls(self.captured, parent=capture, heading=False, explain=False)
+        self.build_drive_controls()
 
         # -- rarely needed details ---------------------------------------------------
         details = expander(self.controls, "Details", tooltip="Map sizes, cache state and data notes.")
@@ -650,6 +652,81 @@ class WorkspacePage(Page):
         self.selection_signature = (self.model.session["selected_id"], id(capture), self.source.get())
 
     # -- one-shot localisation (Codes 04/05/06 through workspace_localisation) -------
+    # -- manual driving (docs/specs/workspace_drive.md) ------------------------------
+    def build_drive_controls(self):
+        body = heading(self.controls, "Drive (robot)",
+                       "Manual driving over Wi-Fi with the professor's HTTP routes. Keys act only "
+                       "while the drive pad has focus; releasing a key or leaving the pad stops.")
+        self.drive = robot_drive.DriveController()
+        line = row(body)
+        ttk.Label(line, text="URL", style="Field.TLabel", width=7).pack(side="left")
+        self.drive_url = ttk.Entry(line)
+        self.drive_url.insert(0, robot_drive.DEFAULT_URL)
+        self.drive_url.pack(side="left", fill="x", expand=True)
+        line = row(body)
+        button(line, "Connect", self.drive_connect, side="left",
+               tooltip="Join the robot's Wi-Fi first. Sends /ping.")
+        button(line, "Disconnect", self.drive.disconnect, side="left",
+               tooltip="Sends /stop, then stops sending commands.")
+        line = row(body)
+        ttk.Label(line, text="Speed", style="Field.TLabel", width=7).pack(side="left")
+        self.drive_speed_label = ttk.Label(line, text=str(robot_drive.DEFAULT_SPEED), width=4)
+        self.drive_speed_label.pack(side="right")
+        self.drive_speed = ttk.Scale(line, from_=0, to=255, command=self.drive_speed_changed)
+        self.drive_speed.set(robot_drive.DEFAULT_SPEED)
+        self.drive_speed.pack(side="left", fill="x", expand=True)
+        tip(self.drive_speed, "Motor PWM 0-255 sent with each move (MecanumCar_v2 default 80).")
+        self.drive_status = note(body, "Not connected.")
+        self.drive_pad = tk.Frame(body, takefocus=1, background=CHROME_2, highlightthickness=2,
+                                  highlightbackground=THEME.border, highlightcolor=SELECT)
+        self.drive_pad.pack(fill="x", pady=(2, 4))
+        hint = tk.Label(self.drive_pad, text="Click here, then hold\nZ S forward/back · Q D strafe · "
+                                             "A E rotate\nSpace = STOP",
+                        background=CHROME_2, foreground=THEME.text, justify="center", pady=6)
+        hint.pack(fill="x")
+        for widget in (self.drive_pad, hint):
+            widget.bind("<Button-1>", lambda _: self.drive_pad.focus_set())
+        self.drive_pad.bind("<KeyPress>", self.drive_key)
+        self.drive_pad.bind("<KeyRelease>", self.drive_key_up)
+        self.drive_pad.bind("<FocusOut>", lambda _: self.drive.stop())
+
+    def drive_connect(self):
+        self.drive.set_speed(self.drive_speed.get())
+        self.drive.connect(self.drive_url.get())
+
+    def drive_speed_changed(self, value):
+        speed = int(float(value))
+        self.drive.set_speed(speed)
+        set_text(self.drive_speed_label, str(speed))
+
+    def drive_key(self, event):
+        key = event.keysym.lower()
+        if key in ("space", "escape"):
+            self.drive.stop()
+            return "break"
+        if key in robot_drive.KEYS:
+            self.drive.hold(key)  # Windows auto-repeat only renews the same hold
+            return "break"
+        return None
+
+    def drive_key_up(self, event):
+        key = event.keysym.lower()
+        if key in robot_drive.KEYS:
+            self.drive.release(key)
+            return "break"
+        return None
+
+    def tick_drive(self):
+        if not self.alive:  # a closed page can still be ticked while others close
+            return
+        try:
+            focused = self.frame.focus_get() is self.drive_pad
+        except (KeyError, tk.TclError):  # focus inside a combobox popdown
+            focused = False
+        if focused and self.drive_pad.winfo_viewable():
+            self.drive.keepalive()  # without it the worker drops a held key in 0.5 s
+        set_text(self.drive_status, self.drive.status()[1])
+
     def build_localisation_controls(self):
         body = heading(self.controls, "Localisation",
                        "Localise ONE independent scan on the fixed global maps. The scan is "
@@ -1043,6 +1120,7 @@ class WorkspacePage(Page):
         self.set_info(f"Captured {len(points)} points (sensor frame; no global pose).")
 
     def tick(self):
+        self.tick_drive()
         if self.revision != self.model.revision:
             return  # show_page recreates stale derived views on returning
         signature = (self.model.session["selected_id"],
@@ -1052,6 +1130,7 @@ class WorkspacePage(Page):
         self.tick_localisation()
 
     def close(self):
+        self.drive.close()  # sends /stop if connected; ends the worker thread
         for job in (self.link_job, self.layout_job):
             if job is not None:
                 self.frame.after_cancel(job)
