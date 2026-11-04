@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import localisation_common as common
+from workspace_inputs import WorkspaceInputs
 
 part1 = common.day1("part1")
 part2 = common.day1("part2")
@@ -54,6 +55,7 @@ class SharedSession:
         self.digest = self.saved_digest
         self.scans = mapping_scans(self.session)
         self.cache = {}
+        self.workspace_inputs = WorkspaceInputs()
         self.measured = {}
         self.measured_path = common.measured_poses_path(self.path) if path else None
         if self.measured_path and self.measured_path.is_file():
