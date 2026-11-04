@@ -157,8 +157,11 @@ Not verified this session:
 
 ## Uncommitted changes and Git status
 After this session's commit, only `firmware/autonomy_robot/src/protocol.h` and `protocol.cpp`
-remain untracked (the unverified v1 draft, deliberately not committed). `__pycache__` folders are
-ignored by Git.
+remain untracked (the unverified v1 draft, deliberately not committed).
+- There is no root `.gitignore` (an open M1 decision), so stage files explicitly by path.
+- No `__pycache__` folders were present in this worktree when it was checked.
+- The pushed branch head contains everything described above: steps 1-2c, the docs and the
+  109 tests.
 
 ## Suggested spec status changes (awaiting approval)
 - `docs/specs/autonomy_phase_b.md`: Draft → Approved. The plan and each later change were
