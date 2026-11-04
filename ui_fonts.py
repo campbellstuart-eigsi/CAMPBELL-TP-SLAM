@@ -102,6 +102,8 @@ class TechnicalLabel(tk.Canvas):
     Split the text by its real cmap, instead of trusting automatic fallback.
     This is a label only; it owns no plot, data or navigation state.
     """
+    # Defaults equal THEME.background / THEME.text; ui_theme imports this
+    # module, so the tokens cannot be imported here. Callers pass their colours.
     def __init__(self, parent, text, fonts, size=11, background="#1F2024",
                  foreground="#DDD9D6", padx=6, pady=3, width=None, tabular=False):
         """width: fixed pixel width (readouts must not resize their bar).

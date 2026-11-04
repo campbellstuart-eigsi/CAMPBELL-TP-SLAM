@@ -14,7 +14,7 @@ from desktop_app import (Page, GridPage, CHROME, CHROME_2, SELECT, VIEW_BG, VIEW
                          VIEW_TEXT, VIEW_MUTED, RESIZE_SETTLE_MS,
                          button, expander, heading, note, row, tip, set_text)
 from ui_fonts import FontSet, TechnicalLabel
-from ui_theme import THEME
+from ui_theme import PLOT, THEME
 
 
 GLOBAL_VIEWS = ("scan", "grid", "vector")
@@ -35,17 +35,22 @@ NAV_HELP = "\n\nClick a viewport to make the tool bar act on it; double-click a 
 # into the background, observed free floor is a visible graphite, occupied
 # walls are the brightest element (light paper: free white, occupied black).
 DARK_GRID = LinearSegmentedColormap.from_list("occupancy_dark", [
-    (0.0, "#4B4D56"),                     # free (0) — observed floor
-    (part2.UNKNOWN / 255, "#1A1B1F"),     # unknown (127) — background
-    (1.0, "#EEE8E0"),                     # occupied (255) — walls
+    (0.0, PLOT.dark_free),                     # free (0) — observed floor
+    (part2.UNKNOWN / 255, PLOT.dark_unknown),  # unknown (127) — background
+    (1.0, PLOT.dark_occupied),                 # occupied (255) — walls
 ])
 PLOT_STYLES = {
-    "Dark": dict(face="#1A1B1F", tick=THEME.secondary, label=THEME.text, spine="#3F3D46",
-                 grid=("#3A3940", 0.5, 1.0), cmap=DARK_GRID, vector="#E6E1DA",
-                 current="#8DB4D2", empty=THEME.secondary),
+    "Dark": dict(face=PLOT.dark_face, tick=THEME.secondary, label=THEME.text, spine=PLOT.dark_spine,
+                 grid=(PLOT.dark_grid, 0.5, 1.0), cmap=DARK_GRID, vector=PLOT.dark_vector,
+                 current=PLOT.dark_current, empty=THEME.secondary,
+                 recorded=PLOT.recorded_pose, axis=PLOT.axis_dark, initial=PLOT.initial_guess,
+                 estimate=PLOT.estimate_dark, alternative=PLOT.alternative_dark),
     "Light paper": dict(face=THEME.paper, tick=VIEW_MUTED, label=VIEW_TEXT, spine=THEME.plot_spine,
-                        grid=("#B0B0B0", 0.4, 0.35), cmap="gray_r", vector="#153D71",
-                        current="#246F9D", empty="#555555"),
+                        grid=(PLOT.paper_grid, 0.4, 0.35), cmap="gray_r", vector=PLOT.paper_vector,
+                        current=PLOT.paper_current, empty=PLOT.paper_empty,
+                        recorded=PLOT.recorded_pose, axis=PLOT.axis_paper,
+                        initial=PLOT.initial_guess, estimate=PLOT.estimate_paper,
+                        alternative=PLOT.alternative_paper),
 }
 LEGEND = (("Occupied", part2.OCCUPIED), ("Free", part2.FREE), ("Unknown", part2.UNKNOWN))
 
@@ -178,7 +183,9 @@ class Viewport:
 
     def close(self):
         if self.resize_job is not None:
-            self.frame.after_cancel(self.resize_job)
+            # Cancel through the widget that scheduled it (on_configure), so
+            # Tk's command list stays consistent for its later destroy().
+            self.canvas.get_tk_widget().after_cancel(self.resize_job)
             self.resize_job = None
 
 
@@ -524,18 +531,20 @@ class WorkspacePage(Page):
         self.set_info("Maps ready (cached for this session).")
 
     def create_selection_artists(self):
+        style = self.style()
         self.pose_artists = {}
         for key in GLOBAL_VIEWS:
             axes = self.views[key].axes
-            marker, = axes.plot([], [], "o", ms=7, mfc="none", mec="#DC7824", mew=1.7, zorder=5)
-            heading, = axes.plot([], [], color="#DC7824", linewidth=1.7, zorder=5)
+            marker, = axes.plot([], [], "o", ms=7, mfc="none", mec=style["recorded"], mew=1.7, zorder=5)
+            heading, = axes.plot([], [], color=style["recorded"], linewidth=1.7, zorder=5)
             self.pose_artists[key] = marker, heading
-        self.highlight = self.views["scan"].axes.scatter([], [], s=3, color="#DC7824", zorder=4)
+        self.highlight = self.views["scan"].axes.scatter([], [], s=3, color=style["recorded"], zorder=4)
         axes = self.views["current"].axes
-        self.current_points = axes.scatter([], [], s=3, color=self.style()["current"])
-        axes.plot(0, 0, "+", ms=9, color="#DC7824")
-        axes.annotate("+X", xy=(0.4, 0), xytext=(0.65, 0), color="#9A4D10",
-                      arrowprops={"arrowstyle": "<-", "color": "#DC7824"}, fontsize=8)
+        self.current_points = axes.scatter([], [], s=3, color=style["current"])
+        self.axis_cross, = axes.plot(0, 0, "+", ms=9, color=style["axis"])
+        self.axis_label = axes.annotate("+X", xy=(0.4, 0), xytext=(0.65, 0), color=style["axis"],
+                                        arrowprops={"arrowstyle": "<-", "color": style["axis"]},
+                                        fontsize=8)
 
     def select_id(self, scan_id):
         if scan_id != self.model.session["selected_id"]:
@@ -611,6 +620,9 @@ class WorkspacePage(Page):
         if hasattr(self, "segments"):
             self.segments.set_color(style["vector"])
         self.current_points.set_color(style["current"])
+        self.axis_cross.set_color(style["axis"])
+        self.axis_label.set_color(style["axis"])
+        self.axis_label.arrow_patch.set_color(style["axis"])
         cmap = colormaps[style["cmap"]] if isinstance(style["cmap"], str) else style["cmap"]
         for swatch, (_, value) in zip(self.legend_swatches, LEGEND):
             fraction = (value - part2.FREE) / (part2.OCCUPIED - part2.FREE)

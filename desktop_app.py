@@ -31,7 +31,7 @@ from app_session import (SharedSession, CaptureAdapter, build_grid, build_vector
                          part1, part2, part3, grid_localisation as loc,
                          vector_localisation as vloc, scan_localisation as sloc)
 from ui_fonts import FontSet, TechnicalLabel
-from ui_theme import THEME, apply_styles
+from ui_theme import PLOT, THEME, apply_styles
 
 # -- Theme: graphite chrome (ui_theme.THEME); purple = active, green = confirmed.
 CHROME = THEME.panel              # docks and panels
@@ -44,7 +44,7 @@ TEXT = THEME.text
 MUTED = THEME.secondary
 SELECT = THEME.purple             # active tool, active tab, selection
 # Drawn on the light plot paper, so these stay the darker data-legible tones.
-OK_COLOUR, WEAK_COLOUR, BAD_COLOUR = "#1B7F4B", "#9A6700", "#B3261E"
+OK_COLOUR, WEAK_COLOUR, BAD_COLOUR = PLOT.verdict_ok, PLOT.verdict_weak, PLOT.verdict_bad
 VIEW_BG = THEME.viewport          # viewport surround (the plot area keeps its data colours)
 VIEW_CAPTION = THEME.viewport_title
 VIEW_TEXT = THEME.text
@@ -376,7 +376,7 @@ class Page:
         try:
             colour = to_hex(colour)
         except (ValueError, TypeError):
-            colour = "#999999"
+            colour = THEME.secondary
         if colour not in self.swatches:
             image = tk.PhotoImage(master=self.frame, width=11, height=11)
             image.put(THEME.border, to=(0, 0, 11, 11))
@@ -1753,9 +1753,9 @@ class VectorLocalisationPage(NewScanLocalisationPage):
     def draw_reference(self, ax):
         vmap = self.vmap
         ax.add_collection(LineCollection(np.stack([vmap.starts, vmap.ends], axis=1),
-                                         colors="#16232F", linewidths=2.2, zorder=2))
+                                         colors=PLOT.vector_reference, linewidths=2.2, zorder=2))
         left, right, bottom, top = vmap.segment_extent
-        return ([Line2D([], [], color="#16232F", lw=2.2,
+        return ([Line2D([], [], color=PLOT.vector_reference, lw=2.2,
                         label=f"vector map ({len(vmap.starts)} segments)")],
                 ((left - 0.5, right + 0.5), (bottom - 0.5, top + 0.5)))
 

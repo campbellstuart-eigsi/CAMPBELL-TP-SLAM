@@ -419,5 +419,99 @@ class WorkspaceGuiTests(unittest.TestCase):
 GridModes = list(desktop_app.GridPage.MODES)
 
 
+class WorkspaceCloseResizeTests(unittest.TestCase):
+    """Regression: closing while a viewport resize is pending raised
+    TclError("can't delete Tcl command"). Viewport.on_configure schedules the
+    settle callback on the canvas widget; Viewport.close cancelled it through
+    the frame, which deleted the Tcl command but left it in the canvas's
+    command list, so the canvas's destroy() failed."""
+
+    def open_workspace(self, geometry="1440x900+0+0"):
+        root = tk.Tk()
+        root.geometry(geometry)
+        errors = []
+        root.report_callback_exception = lambda t, v, tb: errors.append(repr(v))
+        app = desktop_app.DesktopApp(root, gui.SESSION, initial_page="Workspace")
+        page = app.pages["Workspace"]
+        self.pump(root, lambda: not page.busy and not any(
+            v.resize_job for v in page.views.values()))
+        return root, app, page, errors
+
+    def pump(self, root, condition, timeout=60):
+        deadline = time.monotonic() + timeout
+        while not condition():
+            self.assertLess(time.monotonic(), deadline, "GUI condition timed out")
+            root.update()
+            time.sleep(0.02)
+
+    def close(self, app):
+        with mock.patch("desktop_app.messagebox.askyesnocancel", return_value=False):
+            app.close()
+
+    def setUp(self):
+        self.hashes = {p: part2.file_sha256(p) for p in common.SCANS_DIR.glob("*.json")}
+
+    def tearDown(self):
+        for path, digest in self.hashes.items():
+            self.assertEqual(part2.file_sha256(path), digest)
+
+    def test_close_while_resize_callbacks_are_pending(self):
+        for attempt in range(3):
+            with self.subTest(attempt=attempt):
+                root, app, page, errors = self.open_workspace()
+                root.geometry("1300x820")
+                root.update()
+                self.assertTrue(all(v.resize_job for v in page.views.values()),
+                                "every viewport must have a pending resize callback")
+                self.close(app)  # previously TclError: can't delete Tcl command
+                self.assertTrue(app.closed)
+                self.assertEqual(errors, [])
+
+    def test_resize_still_settles_and_redraws_at_new_size(self):
+        root, app, page, errors = self.open_workspace()
+        try:
+            before = {k: v.canvas.get_tk_widget().winfo_width() for k, v in page.views.items()}
+            root.geometry("1200x780")
+            root.update()
+            self.assertTrue(any(v.resize_job for v in page.views.values()))
+            self.pump(root, lambda: not any(v.resize_job for v in page.views.values()))
+            root.update()
+            for key, view in page.views.items():
+                widget = view.canvas.get_tk_widget()
+                self.assertNotEqual(widget.winfo_width(), before[key], key)
+                width, height = view.figure.get_size_inches() * view.figure.dpi
+                self.assertEqual((round(width), round(height)),
+                                 (widget.winfo_width(), widget.winfo_height()), key)
+            self.assertEqual(errors, [])
+        finally:
+            self.close(app)
+
+
+class WorkspacePoseColourTests(unittest.TestCase):
+    """The Workspace uses the approved pose vocabulary in both plot styles."""
+    open_workspace = WorkspaceCloseResizeTests.open_workspace
+    pump = WorkspaceCloseResizeTests.pump
+    close = WorkspaceCloseResizeTests.close
+
+    def test_recorded_pose_green_and_axis_cross_follows_style(self):
+        from matplotlib.colors import to_hex
+        root, app, page, errors = self.open_workspace()
+        try:
+            for style in workspace_page.PLOT_STYLES:
+                page.plot_style.set(style)
+                page.set_plot_style()
+                root.update()
+                expected = workspace_page.PLOT_STYLES[style]
+                for marker, heading in page.pose_artists.values():
+                    self.assertEqual(to_hex(marker.get_markeredgecolor()), to_hex(expected["recorded"]))
+                    self.assertEqual(to_hex(heading.get_color()), to_hex(expected["recorded"]))
+                self.assertEqual(to_hex(page.highlight.get_facecolor()[0]), to_hex(expected["recorded"]))
+                self.assertEqual(to_hex(page.axis_cross.get_color()), to_hex(expected["axis"]), style)
+                self.assertEqual(to_hex(page.axis_label.get_color()), to_hex(expected["axis"]), style)
+            self.assertEqual(errors, [])
+        finally:
+            self.close(app)
+
+
 if __name__ == "__main__":
     unittest.main()
