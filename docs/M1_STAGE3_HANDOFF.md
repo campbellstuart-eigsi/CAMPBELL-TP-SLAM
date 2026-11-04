@@ -14,23 +14,29 @@ completely (including its `serial-discovery`/`arduino-cli` helpers) and replug t
 ---
 
 ## 1. Git state
-- Branch `feature/ui-redesign`, HEAD **8ed4457** "Checkpoint: SLAM Workspace UI redesign",
-  equal to `origin/feature/ui-redesign`. `main` = `origin/main` = bd8b842. Nothing is staged,
-  there are no stashes, and nothing from Stages 0-2 is committed.
-- **Modified (tracked, uncommitted):**
+- Branch `feature/ui-redesign`, pushed to `origin/feature/ui-redesign`. `main` =
+  `origin/main` = bd8b842.
+- **All Stage 0-2 code and tests are committed** in **e5f1a1d** "M1: UI polish, localisation
+  adapter and Stage 3 handoff" (2026-11-04), on top of 8ed4457. Its 10 files:
 
   | File | Change |
   |---|---|
   | desktop_app.py | Stage 1 tokens |
-  | test_gui_workspace.py | Stage 0 and Stage 1 tests |
   | ui_fonts.py | comment |
   | ui_theme.py | Stage 1 |
   | workspace_inputs.py | Stage 2 |
   | workspace_page.py | Stage 0 fix and Stage 1 |
+  | workspace_localisation.py | new, Stage 2 |
+  | test_gui_workspace.py | Stage 0 and Stage 1 tests |
+  | test_ui_theme.py | new |
+  | test_workspace_localisation.py | new |
+  | this handoff | new |
 
-  `git diff --stat` shows 6 files, +197/−24.
-- **New (untracked) and part of M1:** `workspace_localisation.py`,
-  `test_workspace_localisation.py`, `test_ui_theme.py`, and this file.
+  In total: +1183/−24 lines.
+- A documentation-only commit follows e5f1a1d. It holds the template sync (`AGENTS.md`,
+  `CLAUDE.md`, `.template-version`, `workflows/`, `docs/STATUS.md`, the `docs/` folder
+  placeholders) and this Git-state update. Run `git log --oneline -3` to see the current HEAD.
+  Nothing is staged and there are no stashes.
 - **Untracked, not part of M1. Leave them alone:**
   - `results/` (evidence)
   - `.idea/`, `__pycache__/`, `hang.log`
@@ -38,7 +44,7 @@ completely (including its `serial-discovery`/`arduino-cli` helpers) and replug t
   - the three French TP `.md` files
   - `scans/classroom_extended.json` (byte-identical to `classroom_final.json`)
   - `assets/fonts/` (`README.md`, `.gitignore`, and an ignored `local/` that holds the font)
-- **Open Git issue (the user decides):** 8ed4457 tracks
+- **Open Git issue (the user decides):** 8ed4457 added, and the branch still tracks,
   `assets/engineering-plot-regular_freefontdownload_org.zip`, whose redistribution rights are
   unresolved. It is on `feature/ui-redesign` and its remote, not on `main`, and there is no root
   `.gitignore`. Proposed fix, without rewriting history:
