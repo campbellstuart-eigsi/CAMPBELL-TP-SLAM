@@ -85,6 +85,7 @@ class WorkspaceGuiTests(unittest.TestCase):
     def tearDown(self):
         with mock.patch("desktop_app.messagebox.askyesnocancel", return_value=False):
             self.app.close()
+        gui.collect_closed_app()
         for path, digest in self.hashes.items():
             self.assertEqual(part2.file_sha256(path), digest)
 
@@ -447,6 +448,7 @@ class WorkspaceCloseResizeTests(unittest.TestCase):
     def close(self, app):
         with mock.patch("desktop_app.messagebox.askyesnocancel", return_value=False):
             app.close()
+        gui.collect_closed_app()
 
     def setUp(self):
         self.hashes = {p: part2.file_sha256(p) for p in common.SCANS_DIR.glob("*.json")}

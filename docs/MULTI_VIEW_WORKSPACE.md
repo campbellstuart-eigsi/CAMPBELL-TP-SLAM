@@ -30,9 +30,10 @@ page remains unchanged.
 
 - One recorded scan selection is shared with Code 01 and all relevant Workspace
   views. Selection changes do not invalidate the mapping cache or dirty the file.
-- Global markers show the selected scan's **recorded alignment pose**, not a
-  live estimate. Hidden scans remain available in the local panel but have no
-  global marker. Viewing a fresh capture does not place it on a global map.
+- Green global markers show the selected scan's **recorded alignment pose**.
+  They are never an estimate. Hidden scans remain available in the local panel
+  but have no global marker. Viewing a fresh capture does not place it on a
+  global map; only a finished localisation (below) draws an estimate.
 - Workspace capture uses the existing bounded Code 01 capture adapter. The
   latest completed capture from any desktop page is available in the fourth
   panel. Workspace capture does not add that scan to the accumulated map.
@@ -41,14 +42,38 @@ page remains unchanged.
   arrays and global point transforms. Resize, selection, pan, zoom and maximise
   must never rebuild maps. Session edits invalidate derived results as before.
 
+## One-shot localisation (M1 Stage 3)
+
+The **Localisation** group localises ONE independent scan on the fixed global
+maps, through `workspace_localisation` only (the same calls and inputs as pages
+04, 05 and 06, bit for bit).
+
+- **Target:** the latest completed capture, or one scan of a separate recording
+  (its saved pose is ignored). Scans that belong to the open session are refused
+  as self-matching. The target is never added to the session or written to disk.
+- **Method:** 04 Grid, 05 Vector or 06 Scan (accumulated, or one reference scan).
+  **Search:** global, or local around an initial guess in Day 1 units.
+- **Result:** the blue estimate (pose and aligned target points) is drawn at the
+  same pose on Scan Map, Occupancy Grid and Vector Map. `ok` is filled; `weak`
+  is hollow with a dashed heading ("plausible, not confirmed"). Rejected results
+  draw no pose and no runner-up; their status is shown in the verdict chip and
+  result text. A local search also shows the orange guess.
+- The Current Scan shows the target's own sensor-local points; the global
+  estimate is never applied there.
+- A result is discarded if the target, method, guess, reference or session
+  revision changes during the search, and cleared if they change afterwards.
+  Code 04 local search cannot be cancelled; its stale result is discarded.
+- Only `ok` and `weak` results are published as `WorkspaceInputs.latest_estimate`.
+
 ## Future interfaces
 
 `ScanFrame` and `LiveScanSource.latest_scan()` describe sensor-local samples.
 `EstimatedRobotPose` and `RobotPoseSource.latest_pose()` separately describe
 global estimated X/Y in metres, counterclockwise heading in radians, and a
 timestamp in seconds. Both providers are optional and inactive in this version.
-No scan-to-pose inference, continuous acquisition, tracking or localisation loop
-is implemented. A future integration must explicitly supply and associate poses.
+Localisation is one-shot and user-triggered only: no continuous acquisition,
+tracking or localisation loop is implemented. A future integration must
+explicitly supply and associate poses.
 
 ## Preservation and acceptance
 

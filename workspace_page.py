@@ -1,6 +1,9 @@
 """Four cached map views in the existing Tk desktop; no mapping algorithms."""
+from pathlib import Path
+import threading
+import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -9,12 +12,17 @@ from matplotlib import colormaps
 from matplotlib.colors import LinearSegmentedColormap, to_hex
 from matplotlib.figure import Figure
 
-from app_session import build_grid, build_vectors, part1, part2, grid_localisation as loc
-from desktop_app import (Page, GridPage, CHROME, CHROME_2, SELECT, VIEW_BG, VIEW_CAPTION,
-                         VIEW_TEXT, VIEW_MUTED, RESIZE_SETTLE_MS,
-                         button, expander, heading, note, row, tip, set_text)
+import localisation_common as common
+from app_session import build_grid, build_vectors, part1, part2, grid_localisation as loc, \
+    vector_localisation as vloc
+from desktop_app import (Page, GridPage, PoseInputs, VectorLocalisationPage, ScanLocalisationPage,
+                         CHROME, CHROME_2, SELECT, VIEW_BG, VIEW_CAPTION, VIEW_TEXT, VIEW_MUTED,
+                         RESIZE_SETTLE_MS, RESULT_ADVICE, VERDICT_STYLES, button, expander,
+                         field_label, heading, note, row, tip, set_text, show_verdict_chip)
 from ui_fonts import FontSet, TechnicalLabel
 from ui_theme import PLOT, THEME
+import workspace_localisation as wl
+from workspace_inputs import ScanFrame
 
 
 GLOBAL_VIEWS = ("scan", "grid", "vector")
@@ -25,9 +33,13 @@ VIEW_HELP = {
             "(Scan 1), metres.",
     "grid": "Code 02 occupancy grid, global frame, metres. Display mode in Properties.",
     "vector": "Code 03 extracted and merged finite line segments. Global frame, metres.",
-    "current": "Selected recorded scan or latest capture in the LiDAR's own frame: origin "
-               "(0, 0), heading along +X, metres. No live pose estimate or tracking.",
+    "current": "Selected recorded scan, latest capture or localisation target in the LiDAR's "
+               "own frame: origin (0, 0), heading along +X, metres. The global estimate is "
+               "never applied here; no live tracking.",
 }
+TARGETS = ("Latest capture", "Scan from a separate recording")
+MEASURE_LINES = {"vector": VectorLocalisationPage.measure_lines,
+                 "scans": ScanLocalisationPage.measure_lines}  # read only result.details
 NAV_HELP = "\n\nClick a viewport to make the tool bar act on it; double-click a title to maximise."
 
 # Plot styles: only presentation changes. Cell VALUES are never altered; the
@@ -217,11 +229,20 @@ class WorkspacePage(Page):
     SCAN_LIST_NOTE = False
     SCAN_LIST_HINT = ("Select a recorded scan for all Workspace views and 01 Scan. "
                       "Visibility and alignment are edited on 01 Scan.")
-    SOURCES = ("Selected recorded scan", "Latest capture")
+    SOURCES = ("Selected recorded scan", "Latest capture", "Localisation target")
 
     def __init__(self, app):
         self.pending = set()
-        self.capture_busy = False
+        self.capture_busy = False  # any Page.run job: a capture or a localisation
+        # One-shot localisation of an independent scan (never added to the session).
+        self.targets, self.target_source, self.recorded_target = [], "", None
+        self.guess = (0.0, 0.0, 0.0)  # Day 1 units: x m, y m, heading deg
+        self.outcome = self.outcome_key = None
+        self.loc_generation = 0
+        self.stop = threading.Event()  # Page.close() sets it: a closed page's search stops
+        self.loc_label = None
+        self.loc_progress = self.shown_progress = None
+        self.vmap = None
         self.link_job = self.layout_job = None
         self.maximised = None
         self.active = "scan"
@@ -257,6 +278,7 @@ class WorkspacePage(Page):
         else:
             self.current_info = note(current, "")
         tip(self.current_info, VIEW_HELP["current"])
+        self.build_localisation_controls()
 
         display = heading(self.controls, "Display")
         line = row(display)
@@ -300,15 +322,20 @@ class WorkspacePage(Page):
 
         capture = heading(self.controls, "Capture (LD06)")
         self.capture_controls(self.captured, parent=capture, heading=False, explain=False)
-        self.capture_buttons[0].configure(style="Primary.TButton")
 
         # -- rarely needed details ---------------------------------------------------
         details = expander(self.controls, "Details", tooltip="Map sizes, cache state and data notes.")
         self.map_stats = note(details, "")
-        note(details, "Global maps use recorded alignment poses; markers show the selected "
-                      "scan's recorded pose, not a live estimate.")
+        note(details, "Global maps use recorded alignment poses. Green markers show the selected "
+                      "scan's recorded pose; blue shows a one-shot localisation estimate of an "
+                      "independent scan (hollow and dashed when only plausible).")
         note(details, "A Workspace capture stays separate from the global map. Use 01 Scan to "
                       "add and align scans.")
+        self.loc_details = note(details, "")
+        tracking = ttk.Label(details, text="Tracking: continuous tracking is not implemented yet.",
+                             style="Note.TLabel")
+        tracking.state(["disabled"])
+        tracking.pack(fill="x", pady=(2, 4))
         self.global_points = self.model.cache.get("global_points")
         if self.global_points is None:
             self.global_points = part2.global_points_of_scans(self.model.scans)
@@ -316,6 +343,7 @@ class WorkspacePage(Page):
         self.draw_scans()
         self.create_selection_artists()
         self.refresh_selection()
+        self.update_localisation_controls()
         if self.model.scans:
             app.derived(MapRequest(self, "grid", "grid"), "grid", build_grid, self.grid_ready)
             app.derived(MapRequest(self, "vectors", "vector"), "vectors", build_vectors, self.vectors_ready)
@@ -545,6 +573,16 @@ class WorkspacePage(Page):
         self.axis_label = axes.annotate("+X", xy=(0.4, 0), xytext=(0.65, 0), color=style["axis"],
                                         arrowprops={"arrowstyle": "<-", "color": style["axis"]},
                                         fontsize=8)
+        # Localisation overlays: the SAME pose on every global view, never on Current Scan.
+        self.estimate_artists = {}
+        for key in GLOBAL_VIEWS:
+            axes = self.views[key].axes
+            points = axes.scatter([], [], s=3, color=style["estimate"], zorder=6)
+            marker, = axes.plot([], [], "o", ms=8, color=style["estimate"], mew=1.8, zorder=7)
+            heading, = axes.plot([], [], color=style["estimate"], linewidth=1.8, zorder=7)
+            guess, = axes.plot([], [], "o", ms=7, mfc="none", mec=style["initial"], mew=1.5, zorder=6)
+            guess_heading, = axes.plot([], [], color=style["initial"], linewidth=1.5, zorder=6)
+            self.estimate_artists[key] = points, marker, heading, guess, guess_heading
 
     def select_id(self, scan_id):
         if scan_id != self.model.session["selected_id"]:
@@ -591,6 +629,10 @@ class WorkspacePage(Page):
         if self.source.get() == self.SOURCES[1]:
             local = capture.points_local if capture is not None else np.empty((0, 2))
             label = capture.label if capture is not None else "No completed capture"
+        elif self.source.get() == self.SOURCES[2]:
+            target = self.current_target()  # its own local points, exactly
+            local = target.points_local if target is not None else np.empty((0, 2))
+            label = target.label if target is not None else "No localisation target"
         else:
             local = np.column_stack(part1.scan_to_local(selected)) if selected is not None else np.empty((0, 2))
             label = selected["label"] if selected is not None else "No selected scan"
@@ -606,6 +648,370 @@ class WorkspacePage(Page):
         for view in self.views.values():
             view.draw()
         self.selection_signature = (self.model.session["selected_id"], id(capture), self.source.get())
+
+    # -- one-shot localisation (Codes 04/05/06 through workspace_localisation) -------
+    def build_localisation_controls(self):
+        body = heading(self.controls, "Localisation",
+                       "Localise ONE independent scan on the fixed global maps. The scan is "
+                       "never added to the session and no map is rebuilt.")
+        line = row(body)
+        ttk.Label(line, text="Target", style="Field.TLabel", width=7).pack(side="left")
+        self.target_choice = ttk.Combobox(line, state="readonly", values=TARGETS)
+        self.target_choice.current(0)
+        self.target_choice.pack(side="left", fill="x", expand=True)
+        self.target_choice.bind("<<ComboboxSelected>>", lambda _: self.target_changed())
+        tip(self.target_choice, "Latest capture: the last completed LD06 capture (Capture group).\n\n"
+                                "Separate recording: one scan of another session file; its saved "
+                                "pose is ignored. Scans of this session are refused.")
+        self.recording_controls = ttk.Frame(body)
+        button(self.recording_controls, "Load Recorded Scan…", self.choose_recording,
+               tooltip="Open a separate session JSON and pick one of its scans as the target.")
+        self.recorded_choice = ttk.Combobox(self.recording_controls, state="readonly")
+        self.recorded_choice.pack(fill="x", pady=(0, 2))
+        self.recorded_choice.bind("<<ComboboxSelected>>", lambda _: self.choose_recorded_target())
+        self.method_line = line = row(body)
+        ttk.Label(line, text="Method", style="Field.TLabel", width=7).pack(side="left")
+        self.method_choice = ttk.Combobox(line, state="readonly", values=tuple(wl.METHODS.values()))
+        self.method_choice.current(0)
+        self.method_choice.pack(side="left", fill="x", expand=True)
+        self.method_choice.bind("<<ComboboxSelected>>", lambda _: self.inputs_changed())
+        tip(self.method_choice, "04 Grid: occupancy grid. 05 Vector: finite segments. 06 Scan: "
+                                "recorded scans. Each score has its own thresholds; never "
+                                "compare scores across methods.")
+        self.scan_reference_controls = ttk.Frame(body)
+        self.reference_mode = ttk.Combobox(self.scan_reference_controls, state="readonly",
+                                           values=tuple(wl.SCAN_REFERENCES.values()))
+        self.reference_mode.current(0)
+        self.reference_mode.pack(fill="x", pady=(0, 2))
+        self.reference_mode.bind("<<ComboboxSelected>>", lambda _: self.inputs_changed())
+        tip(self.reference_mode, "Code 06 reference: all positioned scans pooled, or ONE recorded "
+                                 "scan at its saved pose (needs real overlap).")
+        self.reference_choice = ttk.Combobox(self.scan_reference_controls, state="readonly",
+                                             values=[f"Scan {s['id']}" for s in self.model.scans])
+        if self.model.scans:
+            self.reference_choice.current(0)
+        self.reference_choice.bind("<<ComboboxSelected>>", lambda _: self.inputs_changed())
+        self.search_line = line = row(body)
+        ttk.Label(line, text="Search", style="Field.TLabel", width=7).pack(side="left")
+        self.search_choice = ttk.Combobox(line, state="readonly", values=tuple(wl.SEARCHES.values()))
+        self.search_choice.current(0)
+        self.search_choice.pack(side="left", fill="x", expand=True)
+        self.search_choice.bind("<<ComboboxSelected>>", lambda _: self.inputs_changed())
+        self.local_controls = ttk.Frame(body)
+        field_label(self.local_controls, "Initial guess (Day 1 units)")
+        self.pose_inputs = PoseInputs(self.local_controls, lambda: self.guess, self.set_guess,
+                                      "Set Guess", "Use the typed X, Y and heading as the local "
+                                                   "search's initial guess (orange).")
+        button(self.local_controls, "Use Selected Scan's Recorded Pose", self.guess_from_selected,
+               tooltip="Copy the selected recorded scan's Day 1 pose into the guess.")
+        self.action_line = line = row(body)
+        self.localise_button = button(line, "Localise", self.localise, style="Primary.TButton",
+                                      side="left", tooltip="Run the selected method once on the "
+                                                           "target. The maps never change.")
+        self.cancel_button = button(line, "Cancel", self.cancel_localisation, side="left",
+                                    tooltip="Stop a running search; nothing is changed. Code 04 "
+                                            "local search cannot be stopped.")
+        line = row(body)
+        button(line, "Clear Result", self.clear_result, side="left",
+               tooltip="Remove the estimate from the global views.")
+        button(line, "Fit View", self.fit_all, side="left", tooltip="Fit every viewport.")
+        self.verdict_chip = ttk.Label(body, text="No result yet", style=VERDICT_STYLES["none"])
+        self.verdict_chip.pack(anchor="w", pady=(4, 0))
+        tip(self.verdict_chip, "Only 'ok' is a position fix; 'weak' is plausible, not confirmed. "
+                               "Rejected results draw no pose.")
+        self.result_text = note(body, "Capture a scan or load a separate recording, then Localise.",
+                                style="Mono.TLabel")
+
+    def method_key(self):
+        return tuple(wl.METHODS)[max(0, self.method_choice.current())]
+
+    def search_key(self):
+        return tuple(wl.SEARCHES)[max(0, self.search_choice.current())]
+
+    def scan_reference_key(self):
+        return tuple(wl.SCAN_REFERENCES)[max(0, self.reference_mode.current())]
+
+    def reference_id(self):
+        index = self.reference_choice.current()
+        return self.model.scans[index]["id"] if 0 <= index < len(self.model.scans) else None
+
+    def current_target(self):
+        if self.target_choice.current() == 1:
+            return self.recorded_target
+        return self.model.workspace_inputs.latest_capture
+
+    def current_request(self):
+        """The wl.Request the controls describe now, or None if incomplete."""
+        target = self.current_target()
+        if target is None:
+            return None
+        local = self.search_key() == "local"
+        try:
+            return wl.Request(self.method_key(), self.search_key(), target.points_local,
+                              target.label, guess_day1=self.guess if local else None,
+                              scan_reference=self.scan_reference_key(),
+                              reference_id=self.reference_id(),
+                              reference_revision=self.model.revision)
+        except ValueError:
+            return None
+
+    def inputs_key(self):
+        """Cheap identity of the inputs (polled by tick); see Request.signature."""
+        local = self.search_key() == "local"
+        scans = self.method_key() == "scans"
+        return (id(self.current_target()), self.method_key(), self.search_key(),
+                self.guess if local else None, self.scan_reference_key() if scans else None,
+                self.reference_id() if scans else None, self.model.revision)
+
+    def update_localisation_controls(self):
+        if self.method_key() == "scans":
+            self.scan_reference_controls.pack(fill="x", after=self.method_line)
+            if self.scan_reference_key() == "single":
+                self.reference_choice.pack(fill="x", pady=(0, 2))
+            else:
+                self.reference_choice.pack_forget()
+        else:
+            self.scan_reference_controls.pack_forget()
+        if self.search_key() == "local":
+            self.local_controls.pack(fill="x", after=self.search_line)
+        else:
+            self.local_controls.pack_forget()
+        if self.target_choice.current() == 1:
+            self.recording_controls.pack(fill="x", after=self.target_choice.master)
+        else:
+            self.recording_controls.pack_forget()
+        cancellable = wl.cancellable(self.method_key(), self.search_key())
+        self.cancel_button.state(["!disabled"] if cancellable else ["disabled"])
+
+    def inputs_changed(self):
+        """Any target, method, search, guess or reference change: a running
+        search's result becomes stale and a shown result is cleared."""
+        self.loc_generation += 1
+        self.update_localisation_controls()
+        if self.outcome is not None and self.inputs_key() != self.outcome_key:
+            self.clear_result("Inputs changed: press Localise again.")
+        else:
+            self.draw_estimate()
+            self.draw_global()
+
+    def target_changed(self):
+        self.inputs_changed()
+        self.source.set(self.SOURCES[2])
+        self.refresh_selection()
+
+    def set_guess(self, pose):
+        self.guess = tuple(float(value) for value in pose)
+        self.inputs_changed()
+
+    def guess_from_selected(self):
+        selected = part1.selected_scan(self.model.session)
+        if selected is None:
+            self.set_info("Select a recorded scan first.")
+            return
+        self.set_guess(selected["pose"])
+        self.pose_inputs.sync()
+
+    def choose_recording(self):
+        path = filedialog.askopenfilename(parent=self.app.root, title="Load a separate recorded scan",
+                                          initialdir=common.SCANS_DIR,
+                                          filetypes=[("LiDAR session JSON", "*.json")])
+        if path:
+            self.load_recording(path)
+
+    def load_recording(self, path):
+        try:
+            targets = wl.load_targets(path)
+        except (ValueError, OSError) as error:
+            self.set_info(f"Could not load {Path(path).name}: {error}")
+            return False
+        self.targets, self.target_source = targets, Path(path).name
+        self.recorded_choice["values"] = [f"{t['id']} — {t['name']}" for t in targets]
+        self.recorded_choice.current(0)
+        self.target_choice.current(1)
+        return self.choose_recorded_target()
+
+    def choose_recorded_target(self):
+        index = self.recorded_choice.current()
+        if not 0 <= index < len(self.targets):
+            return False
+        target = self.targets[index]
+        try:
+            self.recorded_target = ScanFrame(target["points_local"], time.time(),
+                                             f"{self.target_source}: {target['name']}",
+                                             source="recorded")
+        except ValueError as error:
+            self.recorded_target = None
+            self.set_info(str(error))
+            self.target_changed()
+            return False
+        self.target_changed()
+        message = wl.check_target(self.recorded_target.points_local, self.model.scans)
+        self.set_info(message or f"{self.recorded_target.label}: "
+                                 f"{len(self.recorded_target.points_local)} local points; source "
+                                 "pose ignored. Press Localise.")
+        return message is None
+
+    def reference_for(self, method):
+        """The method's fixed reference from the shared caches, or None if not ready."""
+        if method == "grid":
+            return getattr(self, "grid", None)
+        if method == "vector":
+            return self.vmap
+        return self.model.scans
+
+    def prepare_vector_reference(self):
+        """Page 05's VectorMap for this revision, built once on a worker."""
+        merged = self.vector_data[3]
+        if not merged:
+            self.set_info("The vector map has no segments: nothing to localise against.")
+            return
+
+        def ready(vmap):  # cached under the revision it was built for, as page 05
+            self.vmap = vmap
+            set_text(self.views["vector"].caption, f"Global · {len(merged)} segments")
+            self.localise()
+        self.app.derived(MapRequest(self, wl.VECTOR_REFERENCE_KEY, "vector"), wl.VECTOR_REFERENCE_KEY,
+                         lambda _: vloc.VectorMap.from_merged(merged), ready)
+
+    def localise(self):
+        if self.busy:
+            self.set_info("A capture is running: wait for it or cancel it."
+                          if self.app.capture_owner is self else
+                          "Maps are still building: wait, then press Localise."
+                          if self.pending else "A localisation is already running.")
+            return False
+        target = self.current_target()
+        if target is None:
+            self.set_info("Capture a scan or load a separate recording first.")
+            return False
+        message = wl.check_target(target.points_local, self.model.scans)
+        if message:
+            self.set_info(message)
+            return False
+        method, search = self.method_key(), self.search_key()
+        reference = self.reference_for(method)
+        if reference is None:
+            if method == "vector" and hasattr(self, "vector_data"):
+                self.prepare_vector_reference()
+            else:
+                self.set_info("Maps are still building: wait, then press Localise.")
+            return False
+        request = self.current_request()
+        if request is None:
+            self.set_info("Choose a reference scan for the single-scan reference.")
+            return False
+        generation = self.loc_generation
+        cancellable = wl.cancellable(method, search)
+        self.stop = stop = threading.Event()
+        self.loc_progress = 0.0 if cancellable else None  # Code 04 local reports no progress
+        self.shown_progress = None
+        self.loc_label = f"Localising with {wl.METHODS[method]} ({search} search)…"
+        if not cancellable:
+            self.loc_label += ("\nCode 04 local search cannot be stopped; a stale result "
+                               "will be discarded.")
+
+        def report(fraction):
+            self.loc_progress = fraction  # read by tick() on the Tk thread
+
+        def done(outcome):
+            self.loc_progress = self.shown_progress = None
+            if outcome.status == "cancelled":
+                self.set_info("Search cancelled. Nothing was changed.")
+                return
+            current = self.current_request()
+            if generation != self.loc_generation or current is None \
+                    or outcome.request.signature != current.signature:
+                self.set_info("Target, method, guess or reference changed during the search. "
+                              "Press Localise again.")
+                return
+            self.outcome, self.outcome_key = outcome, self.inputs_key()
+            self.model.workspace_inputs.publish_estimate(outcome.pose, wl.METHODS[method],
+                                                         outcome.status, request.target_label)
+            self.app.last_runtime = f"{outcome.result.runtime_ms:.0f} ms ({wl.METHODS[method]})"
+            self.set_info(f"{outcome.status}: {outcome.result.reason}")
+            self.source.set(self.SOURCES[2])
+            self.refresh_selection()
+            self.show_result()
+
+        job = wl.make_job(request, reference, progress=report,
+                          should_stop=stop.is_set if cancellable else None)
+        return self.run(self.loc_label, job, done, controls=(self.localise_button,))
+
+    def cancel_localisation(self):
+        if wl.cancellable(self.method_key(), self.search_key()):
+            self.stop.set()
+
+    def clear_result(self, message="Result cleared."):
+        self.loc_generation += 1  # a running search's result is discarded too
+        self.outcome = self.outcome_key = None
+        self.model.workspace_inputs.publish_estimate(None, "", "", "")
+        self.set_info(message)
+        self.show_result()
+
+    def show_result(self):
+        outcome = self.outcome
+        show_verdict_chip(self, outcome.result if outcome is not None else None)
+        set_text(self.result_text, self.result_lines())
+        set_text(self.loc_details, "" if outcome is None else
+                 RESULT_ADVICE.get(outcome.status, ""))
+        self.draw_estimate()
+        self.draw_global()
+
+    def result_lines(self):
+        outcome = self.outcome
+        if outcome is None:
+            return "Capture a scan or load a separate recording, then Localise."
+        request, result = outcome.request, outcome.result
+        lines = [f"{wl.METHODS[request.method]} · {request.search} search",
+                 f"target: {request.target_label}"]
+        if outcome.pose_day1 is not None:
+            x, y, degrees = outcome.pose_day1
+            lines += [f"X {x:.3f} m   Y {y:.3f} m", f"heading {degrees:.2f}°"]
+        if result.score is not None:
+            lines.append(f"{outcome.score_label} {result.score:.3f}"
+                         + (f" (runner-up {result.runner_up_score:.3f})"
+                            if result.runner_up_score is not None else ""))
+        if outcome.runner_up_pose is not None:
+            x, y, degrees = common.pose_to_day1(outcome.runner_up_pose)
+            lines.append(f"equally good alternative ({x:.2f}, {y:.2f}, {degrees:.0f}°)")
+        if outcome.pose is not None and request.method in MEASURE_LINES:
+            lines += MEASURE_LINES[request.method](None, result)
+        lines.append(f"time {result.runtime_ms:.0f} ms (algorithm only)")  # reason: Messages
+        return "\n".join(lines)
+
+    def draw_estimate(self):
+        """Overlay artists only: ok filled, weak hollow + dashed, rejected nothing."""
+        style, outcome = self.style(), self.outcome
+        pose = outcome.pose if outcome is not None else None
+        weak = outcome is not None and outcome.plausible
+        aligned = (common.transform_points(outcome.request.points_local, pose)
+                   if pose is not None else np.empty((0, 2)))
+        guess = common.pose_from_day1(self.guess) if self.search_key() == "local" else None
+        for points, marker, heading, guess_marker, guess_heading in self.estimate_artists.values():
+            points.set_offsets(aligned)
+            points.set_color(style["estimate"])
+            points.set_alpha(0.45 if weak else 0.9)
+            loc.set_pose_marker((marker, heading), pose, 0.45)
+            marker.set_color(style["estimate"])
+            marker.set_markerfacecolor("none" if weak else style["estimate"])
+            heading.set_color(style["estimate"])
+            heading.set_linestyle("--" if weak else "-")
+            loc.set_pose_marker((guess_marker, guess_heading), guess, 0.45)
+            guess_marker.set_markeredgecolor(style["initial"])
+            guess_heading.set_color(style["initial"])
+
+    def draw_global(self):
+        for key in GLOBAL_VIEWS:
+            self.views[key].draw()
+
+    def tick_localisation(self):
+        if self.busy and self.loc_progress is not None and self.loc_label is not None:
+            shown = int(self.loc_progress * 20)  # 5 % steps: no label churn
+            if shown != self.shown_progress:
+                self.shown_progress = shown
+                self.set_info(f"{self.loc_label} {shown * 5} %")
+        if self.outcome is not None and self.inputs_key() != self.outcome_key:
+            self.clear_result("Target or session changed: press Localise again.")
 
     def style(self):
         return PLOT_STYLES[self.plot_style.get()]
@@ -627,6 +1033,7 @@ class WorkspacePage(Page):
         for swatch, (_, value) in zip(self.legend_swatches, LEGEND):
             fraction = (value - part2.FREE) / (part2.OCCUPIED - part2.FREE)
             swatch.configure(background=to_hex(cmap(fraction)))
+        self.draw_estimate()
         for view in self.views.values():
             view.draw()
 
@@ -642,6 +1049,7 @@ class WorkspacePage(Page):
                      id(self.model.workspace_inputs.latest_capture), self.source.get())
         if signature != self.selection_signature:
             self.refresh_selection()
+        self.tick_localisation()
 
     def close(self):
         for job in (self.link_job, self.layout_job):
@@ -650,3 +1058,8 @@ class WorkspacePage(Page):
         for viewport in self.views.values():
             viewport.close()
         super().close()
+        # A closed page is freed by the cyclic GC, which may run on a worker
+        # thread; a Tk Variable deleted there blocks it ("main thread is not in
+        # main loop"). Drop the page's Variables now, on the Tk thread.
+        self.pose_inputs.variables.clear()
+        self.source = self.link = self.port = self.baud = None

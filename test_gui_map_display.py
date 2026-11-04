@@ -10,6 +10,7 @@ so every finished map stayed queued and 02 Grid / 03 Vector showed
 read the pixels Tk is actually displaying, not just Matplotlib state.
 """
 import base64
+import gc
 import io
 import time
 import tkinter as tk
@@ -25,6 +26,14 @@ from app_session import part2
 
 SESSION = common.SCANS_DIR / "classroom_final.json"
 VIEW_BG = np.array([int(desktop_app.VIEW_BG[i:i + 2], 16) for i in (1, 3, 5)])
+
+
+def collect_closed_app():
+    """Free a closed app's reference cycles now, on the main thread. Otherwise
+    the cyclic GC may run later on a worker thread of the next test, where each
+    Tk Variable of the destroyed root blocks it ~1 s ("main thread is not in
+    main loop") and gated builds time out."""
+    gc.collect()
 
 
 def displayed_pixels(page):
@@ -66,6 +75,7 @@ class MapDisplayTests(unittest.TestCase):
             self.root.destroy()  # normally already destroyed by app.close()
         except tk.TclError:
             pass
+        collect_closed_app()
         for path, digest in self.hashes.items():
             self.assertEqual(part2.file_sha256(path), digest)
 
@@ -231,6 +241,7 @@ class MissingFontStartupTests(unittest.TestCase):
                 root.destroy()
             except tk.TclError:
                 pass
+            collect_closed_app()
         for path, digest in hashes.items():
             self.assertEqual(part2.file_sha256(path), digest)
 

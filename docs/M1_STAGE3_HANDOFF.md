@@ -1,5 +1,11 @@
 # M1 Stage 3 handoff: Workspace localisation of an independent scan
 
+> **Status update (2026-11-04, later the same day):** Stage 3 has now been **implemented
+> (uncommitted)**, but Gate 3 is **not yet accepted**. For the current state, read
+> `docs/SESSION_HANDOFF.md` and `results/m1_gate3_20261104_092409/REPORT.md`. The brief below is
+> kept unchanged as the original specification, so its "not started" line and line numbers are
+> historical.
+
 Written 2026-11-04 for a fresh Claude Code session. Stage 3 has **not** been started.
 Line numbers refer to the working tree on 2026-11-04. Re-read each location before editing.
 
