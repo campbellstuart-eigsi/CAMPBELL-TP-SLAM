@@ -1,0 +1,5 @@
+# Robot-Maker LD06 library files, copied here only to build: their licence is
+# unconfirmed (docs/decisions/2026-11-04_ld06_library_reuse.md). Never commit them.
+ld06.h
+ld06.cpp
+ld06crc.h

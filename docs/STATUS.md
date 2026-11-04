@@ -1,59 +1,56 @@
 # Project status
 
-_Last updated: 2026-11-04_ · _Branch `feature/autonomy-simulator`, worktree `C:\Users\stuar\Desktop\SLAM-autonomy`_
+_Last updated: 2026-11-04_ · _Branch `feature/http-robot-mvp` (from b48037a), worktree `C:\Users\stuar\Desktop\SLAM-autonomy`_
 
 Current project state only. Keep under ~60 lines; replace outdated items rather than appending.
-The fuller briefing is in `docs/SESSION_HANDOFF.md`.
+The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP change).
 
 ## Progress
-- **Base:** c65a78e (end of M1 Stage 2). Codes 01-06, the desktop app and the Workspace are
-  unchanged here. M1 Stage 3 continues separately on `feature/ui-redesign`
-  (`C:\Users\stuar\Desktop\SLAM`).
-- **Phase B (simulated autonomous mapping), steps 1-2c done** (`docs/specs/autonomy_phase_b.md`):
-  - protocol v2: `autonomy/protocol.py`;
-  - firmware safety model: `autonomy/firmware_model.py`;
-  - `ProtocolRobotLink` over a `Transport`: `autonomy/robot_link.py`;
-  - simulated Wi-Fi: `autonomy/sim_network.py`.
-- **Transport:** Wi-Fi SoftAP + UDP primary, USB serial fallback. The real links raise
-  `NotImplementedError`.
-- **Robot hardware:** motor I2C coprocessor at 0x30 (SDA GPIO19, SCL GPIO21); LD06 on Serial2
-  RX33, PWM32; CCW scan angles. See `docs/research/original_robot_firmware_findings.md`.
-- **Tools:** MSYS2 UCRT64 g++ 16.2.0 (`C:\msys64\ucrt64\bin`, not on PATH); Arduino CLI 1.5.1
-  (bundled with the IDE); ESP32 core 3.3.12.
-
-## Unfinished work
-- **Step 3 (firmware C++ at v2): not started.** The untracked
-  `firmware/autonomy_robot/src/protocol.h/.cpp` are an uncompiled v1 draft; rewrite them.
-- **Steps 4-10:** world and robot simulation, mapping, localiser, frontiers and A*, explorer,
-  dashboard.
+- **Approach B (MVP) approved:** the robot runs the HTTP firmware `firmware/ESP32SlamRobot/`;
+  Python drives it with `autonomy/http_robot_link.py`. Decision
+  `docs/decisions/2026-11-04_mvp_http_firmware.md`. Gates: S0 desk → S1 bench → S2 manual
+  driving + calibration → S3 drive-stop-scan-localise → S4 frontier exploration → S5 Workspace.
+- **S0 (desk) done, not committed:** sketch fixes (motor-task watchdog; `MoveResult` declared
+  early so it compiles), ESP32 compile check, `HttpRobotLink`, `autonomy/fake_http_robot.py`,
+  `test_autonomy_http.py` (17 tests).
+- **Phase B approach A preserved:** steps 1-2c in 364982a on `feature/autonomy-simulator`
+  (protocol v2, firmware model, `ProtocolRobotLink`, simulated Wi-Fi). Step 3 is parked:
+  untracked, uncompiled `firmware/autonomy_robot/src/crc.*` and `protocol.*` (v2). The old v1
+  draft is backed up in the session scratchpad only.
+- **Base:** Codes 01-06, the desktop app and the Workspace are unchanged here. M1 Stage 3
+  continues on `feature/ui-redesign` (`C:\Users\stuar\Desktop\SLAM`).
 
 ## Next steps
-1. Step 3, following `docs/SESSION_HANDOFF.md` "How to resume".
-2. Steps 4-10 (spec section 6). Hardware stages H1-H3 only with explicit approval.
+1. Your review of S0, and a commit only with your approval.
+2. S1 bench test (you flash; wheels off the ground): `firmware/ESP32SlamRobot/README.md`.
+3. S2-S5 (not started).
 
 ## Issues and safety blockers
-- **Unknown:** what the motor coprocessor does on an ESP32 reset or I2C loss (it may hold the last
-  PWM). Test in H2 before any motion.
+- **Unknown, blocks floor tests:** does the motor board hold its last PWM when the ESP32 resets
+  or hangs? S1 step 6 observes it.
+- **No encoders:** `move()` refuses until a `Calibration` measured at S2 is given.
+- **Late HTTP:** a `/drive` delayed in TCP can still start a lease (at most 1 s) late.
+- **Open access point:** anyone joined can drive (CORS `*`); set a unique SSID and password.
 - **Never flash `ESP32MecanumCar.ino`:** it drives the motors for 5 s after boot.
-- **No encoders:** PWM → speed must be calibrated in H2.
-- **LD06 library licence unconfirmed** (README MIT, no LICENSE file). Don't copy the library in.
-- **Simulated Wi-Fi profiles are assumptions:** 4.8 % of MOVEs expired on "poor"; check the
-  250 ms TTL in H1.
-- **From M1:** GUI suite b is unstable; the font zip licence and the missing root `.gitignore`
-  await a decision.
+- **LD06 library licence unconfirmed:** the `ld06.*` files stay out of Git (`.gitignore`).
+- **Firmware libraries** (Async TCP 3.5.0, ESP Async WebServer 3.12.1, MecanumCar_v2) are only in
+  the scratchpad here; the flashing PC needs them installed.
+- **From M1:** GUI suite b is unstable; the font zip licence and the root `.gitignore` await a decision.
 
 ## Key decisions
 - Phase B never modifies Codes 01-06, `localisation_common.py`, `scans/` or the Stage 3 files.
-- `docs/decisions/2026-11-04_*`: SoftAP/UDP; CCW angles; Mecanum I2C driver (mock until H2);
-  LD06 library reuse; 300 mm / 2000 ms per MOVE; no HTTP server.
-- No hardware connection, flashing or real motor output without your approval.
+- `docs/decisions/2026-11-04_*`; the newest is the MVP decision (approach B).
+- No flashing, COM port or robot operation by Claude; hardware stages only with your approval.
 
-## Verified tests
-| Date | Command | Result |
-|------|---------|--------|
-| 2026-11-04 | `.\.venv\Scripts\python.exe -m unittest test_autonomy_protocol test_autonomy_link test_autonomy_wifi` | 33 + 60 + 16 = 109, OK |
-| 2026-11-04 | AGENTS.md headless suite + the 3 autonomy modules, in this worktree | 540 tests, OK (431 + 109; 254 s) |
+## Verified tests (2026-11-04, this worktree)
+| Command | Result |
+|---------|--------|
+| `.\.venv\Scripts\python.exe -m unittest test_autonomy_http -v` | 17 OK (17 s) |
+| AGENTS.md headless suite + `test_autonomy_protocol test_autonomy_link test_autonomy_wifi test_autonomy_http` | 557 OK (251 s) |
+| `arduino-cli compile -b esp32:esp32:esp32` of `ESP32SlamRobot` (scratch libraries) | exit 0; 72 % flash, 28 % RAM; with `--warnings all` the only warning is in `ld06.cpp` |
+| Regenerated `protocol_vectors.h` vs the committed one | identical |
 
 ## Untested / unverified
-- All C++ and any ESP32 build; real Wi-Fi; all hardware.
-- GUI suites and `gui_smoke_test.py` (not run; no GUI file changed on this branch).
+- All hardware: the sketch has never run on the robot; the watchdog, leases and stops are
+  untested on the ESP32.
+- The parked v2 C++ (never compiled). GUI suites and `gui_smoke_test.py` (no GUI file changed).
