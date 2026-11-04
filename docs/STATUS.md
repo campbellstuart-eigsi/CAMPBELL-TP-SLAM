@@ -1,57 +1,59 @@
 # Project status
 
-_Last updated: 2026-11-04_ · _Branch `feature/workspace-drive` (from 832e7ae)_
+_Last updated: 2026-11-04 (paused until Friday 2026-11-06)_ · _Branch `feature/workspace-drive`_
 
 Current project state only. Keep under ~60 lines; replace outdated items rather than appending.
-The fuller resume briefing is `docs/SESSION_HANDOFF.md` (it describes 832e7ae; not yet updated).
+The fuller resume briefing is `docs/SESSION_HANDOFF.md`.
 
 ## Progress
-- **Restart of robot driving from the clean Workspace (832e7ae).** The earlier HTTP MVP on
-  `feature/http-robot-mvp` (worktree `SLAM-autonomy`) is left untouched and is not used.
-- Spec **Approved**: `docs/specs/workspace_drive.md`. The panel speaks the professor's HTTP routes
-  (`/forward` … `/rotateright` `?time=&speed=`, `/stop`, `/ping`). The motor type lives in a
-  firmware adapter. Only I²C is implemented; PWM needs are listed in section 5.
-- **Part 2 firmware** `firmware/WorkspaceDrive/`: the professor's `ESP32RobotControl.ino` +
-  `motor_i2c.h`, 500 ms longest move, optional `speed`, own Wi-Fi name in `wifi_secrets.h`.
-- **Part 3 Workspace Drive panel**: `robot_drive.py` (worker thread, hold-to-drive) and a
-  "Drive (robot)" group in `workspace_page.py`. Keys act only on the drive pad. Release,
-  Space, focus loss, disconnect, close or a failed request send `/stop`.
-- Nothing on this branch is committed yet.
+- **Git:** `feature/workspace-drive` at **ca6826b**, pushed to `origin/feature/workspace-drive`
+  on 2026-11-04 with your approval. It is based on 832e7ae (`feature/ui-redesign`, unchanged).
+  `feature/http-robot-mvp` (74711dc, worktree `SLAM-autonomy`) is untouched and unused.
+- **Software, verified on the PC:**
+  - the seven-page app (`00_main_app.py`);
+  - the four-view Workspace and Codes 01-06 mapping and localisation;
+  - the new **Drive (robot)** panel: `robot_drive.py` plus the panel in `workspace_page.py`;
+  - firmware `firmware/WorkspaceDrive/` (compile only).
+- **Design:** `docs/specs/workspace_drive.md` (Approved); decision
+  `docs/decisions/2026-11-04_workspace_drive_restart.md`.
+- **Hardware:** nothing verified with the new firmware. It has not been flashed.
+- M1 Gate 3 (Workspace localisation) is still not formally accepted (see `SESSION_HANDOFF.md`).
 
-## Next steps (at the robot, wheels in the air; the user flashes)
-1. Part 1 Gate A, no movement commands: board type (I²C 0x30?), the battery powers the ESP32
-   with USB unplugged, the battery switch stops a wheel, no spin at EN/reset.
-2. Gate B: flash `firmware/WorkspaceDrive` (README), browser `/ping` and short moves, the
-   reset-during-move check.
-3. Drive from the Workspace panel (`00_main_app.py`, Workspace, Drive (robot)).
-4. Commit with your approval.
+## Hardware blockers (none solved)
+- The ESP32 stopped working when USB was unplugged, with the battery connected.
+- The front-right wheel spun unexpectedly (earlier firmware sent only zero speed).
+- The motor-controller board type is not physically confirmed (I²C 0x30 or direct PWM).
+- I²C to the motor board is not independently verified; the library ignores ACKs.
+- The battery switch is not yet shown to stop the motors reliably.
 
-## Issues
-- **Unexplained front-right wheel spin** (earlier firmware sent only zero speed). Possibly a
-  different motor board; hardware until shown otherwise. Blocks movement tests.
-- **Wi-Fi disappears without USB:** the ESP32 is probably on USB power only.
-- The professor's sketch uses the same SSID/password on every robot; ours uses `wifi_secrets.h`.
-- The library never checks I²C ACKs: a wrong board fails silently.
-- Earlier M1 items still open: GUI suite b instability (desktop minimises test windows), font
-  licence, root `.gitignore`.
+## Friday 2026-11-06: first action
+Gate A at the robot (wheels off the ground, no movement commands): identify the motor board.
+Full checklist: `docs/SESSION_HANDOFF.md`, "How to resume".
+
+## Priorities
+1. Reliable battery power and motor control.
+2. ESP32 ↔ Python Wi-Fi link.
+3. Real ZQSD driving in the Workspace.
+4. Then live LiDAR localisation. Not now: autonomy, exploration, path planning, new mapping
+   or UI redesign.
 
 ## Key decisions
 - Codes 01-06, `localisation_common.py` and `scans/` are never modified.
-- One HTTP contract for I²C and PWM robots; no auto-detection; PWM only once its hardware is known.
-- No ARM/DISARM or motor lock; safety = firmware 500 ms timeout + panel stop rules + battery switch.
+- One HTTP contract (the professor's routes) for I²C and PWM robots; only I²C implemented.
+- No ARM/DISARM or motor lock. Safety = the firmware's 500 ms timeout, the panel's stop rules
+  and the battery switch.
 
-## Verified tests (2026-11-04, this working tree)
+## Verified tests (2026-11-04)
 | Command | Result |
 |---------|--------|
 | `arduino-cli compile --fqbn esp32:esp32:esp32` professor's `ESP32RobotControl.ino`, unchanged | OK, 944,180 B (72 %) |
-| same, `firmware/WorkspaceDrive` (scratch copy, test secrets, `--warnings all`) | OK, 942,204 B (71 %); short password refused |
-| `-m unittest test_robot_drive -v` | 11 OK |
-| `-m unittest test_gui_workspace_drive -v` | 5 OK (2 runs) |
-| `-m unittest test_workspace test_workspace_localisation test_robot_drive` | 33 OK (before the last `tick_drive` fix) |
-| `-m unittest test_robot_drive test_gui_workspace_drive test_workspace` | 19 OK (after it) |
-| `gui_smoke_test.py` | PASS after the fix (first run found the closed-page tick bug) |
+| same for `firmware/WorkspaceDrive` (scratch copy, test secrets, `--warnings all`) | OK, 942,204 B (71 %); a short password is refused |
+| `.\.venv\Scripts\python.exe -m unittest test_robot_drive -v` | 11 OK |
+| `.\.venv\Scripts\python.exe -m unittest test_gui_workspace_drive -v` | 5 OK (2 runs) |
+| `... -m unittest test_workspace test_workspace_localisation test_robot_drive` | 33 OK (before the `tick_drive` fix) |
+| `... -m unittest test_robot_drive test_gui_workspace_drive test_workspace` | 19 OK (after it) |
+| `.\.venv\Scripts\python.exe gui_smoke_test.py` | PASS (after the fix) |
 
-## Untested / unverified
-- Everything on hardware: the board type, I²C, power, wheel directions, the 500 ms stop and
-  resets.
-- Full suites a and b were not re-run.
+## Untested
+- Everything on the robot: board, power, I²C, wheel directions, the 500 ms stop, real Wi-Fi.
+- Full suites a and b, not re-run on this branch.

@@ -1,259 +1,257 @@
 # Session handoff
 
-_Last updated: 2026-11-04_ · _Session focus: M1 Stage 3 (Workspace localisation of an independent scan) up to the Gate 3 review_
+_Last updated: 2026-11-04 (resume Friday 2026-11-06)_ · _Session focus: restart robot driving
+from the clean Workspace: a Drive (robot) panel and minimal I²C firmware on the professor's HTTP
+routes_
 
 ## Project overview and current state
-LiDAR SLAM Workbench (university project): an LD06 LiDAR read through an ESP32 over USB serial,
-with Tkinter/Matplotlib programs for mapping (Codes 01-03) and localisation (Codes 04-06), plus a
-seven-page desktop app with a four-view Workspace.
+LiDAR SLAM Workbench (EIGSI university project): an LD06 LiDAR on an ESP32-WROOM-32 mecanum
+robot. Python Tkinter/Matplotlib programs do the mapping (Codes 01-03) and localisation (Codes
+04-06), in a seven-page desktop app (`00_main_app.py`) with a four-view Workspace (Scan Map,
+Bitmap / Occupancy Grid, Vector Map, Current Scan / Live Robot).
 
-**M1 Stage 3 is implemented, but Gate 3 is NOT yet accepted.** The code and tests are
-checkpointed in commit **536dba2** ("M1 Stage 3: one-shot localisation implemented, Gate 3
-pending"), pushed with your approval. Most verification passed. The GUI suite b has not passed three times in a row,
-because the desktop kept minimising the test windows (see "GUI minimisation investigation"). Two
-things are still open: a clean GUI verification on an idle desktop, and your Gate 3 approval.
+**Now:**
+- The Workspace has a **Drive (robot)** panel for manual ZQSD driving over Wi-Fi, and
+  `firmware/WorkspaceDrive/` is a minimal I²C firmware based on the professor's sketch.
+- Both are verified **on the PC only** (unit, GUI and smoke tests, Arduino compile).
+- **Nothing has been flashed or tested on the robot.** The hardware blockers below are all
+  open.
 
 ## Completed milestones
 - Day 1 mapping (Codes 01-03) and Day 2 localisation (Codes 04-06), up to bd8b842 (`main`).
-- M1 Stage 0 (baseline and the close/resize fix), Stage 1 (UI consistency) and Stage 2
-  (`workspace_localisation.py` adapter), committed in e5f1a1d (2026-11-04).
-- M1 Stage 3: implemented and verified as below, checkpointed in 536dba2 (pushed), **not
-  accepted**.
+- M1 Stages 0-2 (e5f1a1d) and Stage 3, one-shot Workspace localisation (536dba2 + docs commit
+  832e7ae, on `feature/ui-redesign`).
+  - **Gate 3 has still not been formally accepted:** suite b never passed 3 times in a row,
+    because the desktop minimised the test windows. Details:
+    `results/m1_gate3_20261104_092409/REPORT.md`.
+- Workspace Drive, software only: ca6826b (2026-11-04), pushed.
 
 ## Work performed this session
-- **Stage 3 implementation**, all in `workspace_page.py` (line ranges in the Gate 3 report):
-  - A "Localisation" group placed between "Current scan" and "Display", with:
-    - a target: the latest capture, or one scan of a separate recording, loaded with "Load
-      Recorded Scan…" and a scan chooser
-    - a method: 04 Grid, 05 Vector, or 06 Scan (06 offers accumulated or single, with a
-      reference-scan chooser)
-    - a search: Global, or Local with `PoseInputs` and "Use Selected Scan's Recorded Pose"
-    - the buttons Localise (the only Primary button; "Capture New Scan" is now a normal button),
-      Cancel (enabled only for cancellable searches), Clear Result and Fit View
-    - a verdict chip and the result text
-    - under Details: the advice per status, and a disabled note "continuous tracking is not
-      implemented yet"
-  - Every run goes through `workspace_localisation`:
-    - `check_target` refuses self-matching or invalid targets
-    - `make_job` is run with `Page.run`
-    - a generation counter plus a `Request.signature` check discards stale results (changed
-      target, method, guess, reference or session revision)
-    - `publish_estimate` is called only for `ok` and `weak` results
-    - `app.last_runtime` is set
-  - Overlays use the same pose on Scan, Grid and Vector:
-    - `ok`: filled blue marker
-    - `weak`: hollow marker with a dashed heading
-    - rejected: nothing drawn
-    - local search: orange guess marker
-    - the overlays are recoloured by the plot style
-  - The Current Scan has a third source, "Localisation target", which shows the target's own
-    sensor-local points.
-  - The 05 VectorMap is built once through `app.derived` under the shared `"vector_reference"`
-    cache key, then the run starts automatically.
-  - `close()` releases the page's Tk Variables (`self.stop` is set by `Page.close`).
-- **New tests:** `test_gui_workspace_localisation.py` (6 real-Tk tests; see the Gate 3 report for
-  coverage).
-- **Approved GC teardown fix:**
-  - `test_gui_map_display.collect_closed_app()` calls `gc.collect()` on the main thread after
-    every app close.
-  - It is called in `MapDisplayTests.tearDown`, `MissingFontStartupTests`,
-    `WorkspaceGuiTests.tearDown` and `WorkspaceCloseResizeTests.close`.
-  - No assertions or timeouts were changed.
-  - Cause: Tk Variables of earlier tests' closed apps were freed by the cyclic GC on a worker
-    thread, about 1 s each, which made `test_builds_shared…` time out.
-- **Docs:**
-  - `docs/MULTI_VIEW_WORKSPACE.md`: a one-shot localisation section, and estimate vs recorded
-    pose.
-  - `docs/STATUS.md` updated.
-  - This file.
-  - A status note at the top of `docs/M1_STAGE3_HANDOFF.md`.
-- **Evidence:** `results/m1_gate3_20261104_092409/` holds:
-  - `REPORT.md`
-  - the logs
-  - 16 screenshots
-  - `geometry_investigation/`
-  - `scripts/` (the diagnostic and screenshot scripts, copied from the session scratchpad)
-  - `backup/` (`results/workspace` and `results/gui_review` before the test runs)
+- **Restart decision:** the custom HTTP MVP (`feature/http-robot-mvp`, worktree
+  `C:\Users\stuar\Desktop\SLAM-autonomy`) never moved the robot (its build was locked by
+  design). The work restarted from 832e7ae on the new branch `feature/workspace-drive`.
+  Record: `docs/decisions/2026-11-04_workspace_drive_restart.md`.
+- **Professor's code reviewed** (in `C:\Users\stuar\Downloads`, not in Git):
+  - `ESP32RobotControl.ino`: Wi-Fi access point `RobotESP32` / `12345678` at 192.168.4.1;
+    timed moves of at most 2 s; `/stop`, `/scan`, `/pose`, `/ping`.
+  - `RobotControl.html`: calls the same routes.
+  - `ESP32MecanumCar.ino`: **moves for 5 s at boot**; use it only with the wheels in the air.
+  - `MecanumCar_v2.zip`: software I²C on SDA GPIO19 / SCL GPIO21 to address 0x30, a fixed
+    speed of 80/255, and **no ACK check**. Front-right = "Upper_R", PWM registers 1/2.
+  - `WIFI ROBOT.zip`: holds the course `ld06.*` files.
+- **Spec** `docs/specs/workspace_drive.md` (**Approved** by you):
+  - one HTTP contract for I²C and future PWM robots;
+  - a firmware motor adapter;
+  - section 5 lists the hardware facts a PWM version needs.
+- **Firmware** `firmware/WorkspaceDrive/`:
+  - `WorkspaceDrive.ino`: the professor's sketch, with motor calls through `motor_i2c.h`
+    (`motorsBegin`, `motorsStop`, `motorsMove(move, speed)`);
+  - `MAX_MOVE_MS` 2000 → **500**;
+  - optional `speed=0..255` (default 80);
+  - SSID and password from a local `wifi_secrets.h`, which must be at least 8 characters
+    (`static_assert`);
+  - `wifi_secrets.example.h`, `.gitignore` and `README.md`.
 
-## Exact files in the Stage 3 checkpoint commit 536dba2
-| File | Change |
-|------|--------|
-| `workspace_page.py` | Stage 3: +425/−12 lines (`git diff --numstat`) |
-| `test_gui_workspace_localisation.py` | new, 314 lines, 6 GUI tests |
-| `test_gui_map_display.py` | +11: `collect_closed_app()` and 2 calls (approved) |
-| `test_gui_workspace.py` | +2: calls to `collect_closed_app()` (approved) |
-| `docs/MULTI_VIEW_WORKSPACE.md` | +30/−5: Stage 3 section; wording on estimate vs recorded pose |
-| `docs/STATUS.md` | +43/−47: current state |
-| `docs/SESSION_HANDOFF.md` | new, this file |
-| `docs/M1_STAGE3_HANDOFF.md` | +6: a status note at the top (the original brief is unchanged) |
-
-Not modified: Codes 01-06, `localisation_common.py`, `desktop_app.py`, `app_session.py`,
-`workspace_localisation.py`, `workspace_inputs.py`, `gui_smoke_test.py`, `scans/`, `LD06.zip`.
+  Rotations still last `time / 2`, as in the professor's sketch. Nothing moves at boot.
+- **Python** `robot_drive.py`:
+  - `DriveLink`: urllib, no proxy; timeouts 1.0 s ping, 0.3 s move, 0.5 s stop.
+  - `DriveController`: one worker thread, `robot-drive`, does all the HTTP.
+  - A held key renews a 300 ms move every 150 ms. Rotations send `time=600`, so they last
+    300 ms.
+  - It sends `/stop` (with one retry) on: release, Space or Esc, focus loss, no `keepalive()`
+    for 0.5 s, disconnect, close, or a failed request (which also disconnects).
+- **Workspace** `workspace_page.py` (+79 lines; the views and localisation are unchanged), a
+  "Drive (robot)" group after Capture:
+  - URL (default `http://192.168.4.1`), Connect/Disconnect, Speed 0-255 (default 80), a status
+    line;
+  - a **drive pad**: keys act only while it has focus. Z/S forward/back, Q/D strafe, A/E
+    rotate, Space STOP.
+  - `tick()` sends a keepalive only while the pad is focused and visible. `close()` stops and
+    ends the thread.
+  - Bug found by the smoke test and fixed: a closed page could still be ticked
+    (`tick_drive` now checks `self.alive`).
+- **Tests:**
+  - `test_robot_drive.py` (11, headless, against a local fake robot);
+  - `test_gui_workspace_drive.py` (5, real Tk, local fake robot; never 192.168.4.1).
+- **Docs:** `AGENTS.md` test commands, `docs/STATUS.md`, this file, the decision record and the
+  spec.
 
 ## Important files and locations
 | Path | Purpose |
 |------|---------|
-| `workspace_page.py` | Workspace page; the Stage 3 code is mostly `build_localisation_controls` … `tick_localisation` |
-| `workspace_localisation.py` | the Stage 2 adapter; the only route to Codes 04/05/06 |
-| `test_gui_workspace_localisation.py` | Stage 3 GUI tests |
-| `docs/M1_STAGE3_HANDOFF.md` | the original Stage 3 brief, integration points and safety constraints |
-| `results/m1_gate3_20261104_092409/REPORT.md` | Gate 3 report (changes, tests, parity, decisions) |
-| `results/m1_gate3_20261104_092409/geometry_investigation/` | minimisation evidence |
-| `results/m1_gate3_20261104_092409/scripts/` | `diagnose_mapping.py`, `bare_window_probe.py`, `trace_variables.py`, `trace_with_collect.py`, `page_refcount_probe.py`, `stage3_screenshots.py` |
-| `results/m1_gate0_20261104_041714/hashes_before.json` | SHA-256 of the 8 baseline files |
+| `00_main_app.py` | **Run this**: the seven-page app; the Drive panel is on the Workspace page |
+| `robot_drive.py` | HTTP link and hold-to-drive controller (no Tk) |
+| `workspace_page.py` | Workspace; the Drive code is `build_drive_controls` … `tick_drive` |
+| `firmware/WorkspaceDrive/WorkspaceDrive.ino` | **Firmware to flash** (after Gate A) |
+| `firmware/WorkspaceDrive/motor_i2c.h` | I²C motor adapter (MecanumCar_v2) |
+| `firmware/WorkspaceDrive/README.md` | Library setup, flashing, routes |
+| `docs/specs/workspace_drive.md` | Approved design; section 5 = PWM hardware needs |
+| `docs/decisions/2026-11-04_workspace_drive_restart.md` | Why driving restarted this way |
+| `test_robot_drive.py`, `test_gui_workspace_drive.py` | Drive tests |
+| `C:\Users\stuar\Downloads\ESP32RobotControl.ino`, `MecanumCar_v2.zip`, `WIFI ROBOT.zip`, `RobotControl.html` | Professor's originals (not in Git) |
+| `results/m1_gate3_20261104_092409/REPORT.md` | M1 Gate 3 evidence (untracked) |
 
 ## Tests and verification
-All runs were on 2026-11-04, from the project folder, on the current working tree unless noted.
-
-| Command or check | Result |
-|------------------|--------|
-| Suite b baseline before any Stage 3 edit: `.\.venv\Scripts\python.exe -m unittest test_gui_map_display test_gui_workspace -v` | 12 OK, 85.6 s |
-| Suite a: `.\.venv\Scripts\python.exe -m unittest 01_lidar_visualizer 02_grid_mapping 03_vector_mapping localisation_common 04_grid_localisation 05_vector_localisation 06_scan_localisation test_application test_diagnose_lidar_serial test_workspace test_ui_theme test_workspace_localisation -v` | 431 OK, 235 s (`suite_a_final.log`, after all edits) |
-| `.\.venv\Scripts\python.exe -m unittest test_gui_workspace_localisation -v` | 6 OK in 4 runs; the last (`stage3_gui_gcfix.log`, 165 s) after all edits. The first run had 2 test-helper bugs, since fixed |
-| Suite b after Stage 3, before the GC fix | failed in 5 of 5 runs (1 × 1440x900 unmapped; 4 × `test_builds_shared…` timeout with GC errors) |
-| Suite b after the GC fix (3 runs) | OK, FAILED (`test_workspace_1920x1080`: `[] != ['scan']`), OK; 0 GC errors |
-| `.\.venv\Scripts\python.exe gui_smoke_test.py` | PASS twice, the last at 10:06, **before** the final `workspace_page.py` edit (10:10, which removed the duplicate result-text line) |
-| Parity | `classroom_session.json` scan 3: Workspace = pages 04/05/06 bit for bit (status, pose, score, runner-up score), global and local |
-| Poses | 05 ok (−4.475, 3.533, −102.4°); 06 accumulated weak (−4.467, 3.538, −102.5°); scan 1 on 05 low_score; all match Gate 0 |
-| Baseline hashes (8 files in `hashes_before.json`) | unchanged (checked after suite a, at the end of the session) |
-| `*_measured_poses.json` created | none |
+| Date | Command or check | Result |
+|------|------------------|--------|
+| 2026-11-04 | `arduino-cli compile --fqbn esp32:esp32:esp32` on an unchanged copy of `ESP32RobotControl.ino` (the IDE's bundled arduino-cli, esp32 core 3.3.12) | OK: 944,180 B flash (72 %), 87,128 B RAM |
+| 2026-11-04 | same, `firmware/WorkspaceDrive` scratch copy with test secrets, `--warnings all` | OK: 942,204 B (71 %), 87,128 B RAM; the only warning is in `ld06.cpp` (unused variable) |
+| 2026-11-04 | same with a 5-character password | refused: `static assertion failed` (intended) |
+| 2026-11-04 | `.\.venv\Scripts\python.exe -m unittest test_robot_drive -v` | 11 OK |
+| 2026-11-04 | `.\.venv\Scripts\python.exe -m unittest test_gui_workspace_drive -v` | 5 OK, 2 runs, none skipped |
+| 2026-11-04 | `.\.venv\Scripts\python.exe -m unittest test_workspace test_workspace_localisation test_robot_drive` | 33 OK (before the `tick_drive` fix) |
+| 2026-11-04 | `.\.venv\Scripts\python.exe gui_smoke_test.py` | first run: TclError from `tick_drive` on a closed page (fixed); another run: `OSError: screen grab failed` (likely the window-minimising problem); final run: PASS, 0 tracebacks |
+| 2026-11-04 | `.\.venv\Scripts\python.exe -m unittest test_robot_drive test_gui_workspace_drive test_workspace` | 19 OK (after the fix) |
 
 Not verified this session:
-- Suite b three times in a row on the final tree: blocked by the desktop minimising windows.
-- The smoke test on the final tree: not re-run after the last edit; GUI runs were stopped.
-- A real LD06 capture on COM7 localised in the Workspace: the tests mock the capture and no port
-  was opened.
-
-## GUI minimisation investigation
-- **Symptom:** `test_workspace_1920x1080` failed intermittently: viewports unmapped at the first
-  geometry check, `[] != ['scan']` after maximise, or a 100 s timeout. In isolation it failed in 4
-  of 6 runs.
-- **Finding:** at every failure the Tk root was `state=iconic` (minimised), while the layout was
-  correct (`maximised=scan`, `rows panes=[1, 2]`, the scan frame packed at 693x491). The root
-  changed from normal to iconic 6.8-17.3 s into each run, while the foreground window belonged to
-  another process (window title "Claude").
-- **Control:** a bare idle `tk.Tk()` window, with no project code, was minimised within
-  1.7-9.2 s in 5 of 5 runs, at 1920x1080, 1440x900 and 800x600.
-- **The project never minimises the window.** The only `withdraw()` calls are the standalone
-  02-04 file pickers.
-- **Conclusion:** external desktop interference. It is not an application layout defect and not
-  a test-synchronisation defect.
-- **Not done, by design:** deiconify or retry workarounds, longer timeouts, or removed
-  assertions. The root cause in the desktop environment is unknown.
-- **Unclassifiable:** the Gate 2 failures ("desktop in use") lack a record of the root state.
-- **Evidence:** `geometry_investigation/` (`before_fix_iso1-6.log`, `diagnose_run1.log`,
-  `diagnose_run2.log`, `bare_window_probe.log`) and `scripts/`.
-
-## Outstanding Gate 3 verification
-1. Suite b three times in a row, all OK, on an idle desktop.
-2. `test_gui_workspace_localisation` and `gui_smoke_test.py` on the final tree.
-3. The hash check, repeated at the end.
-4. Your Gate 3 review and acceptance. Then commit and push the updated STATUS, only with your
-   approval.
-5. Optional, needs your approval to open the port: a real COM7 capture localised in the
-   Workspace.
+- **Anything on the robot:** the board type, battery power, I²C, wheel directions, the 500 ms
+  stop and real Wi-Fi timing. No COM port was opened and nothing was flashed.
+- **Full suite a and suite b:** not re-run on this branch (focused tests only, as agreed).
+- **The M1 Gate 3 items** (suite b three times in a row): still open.
 
 ## Known bugs, limitations and open questions
-- **Desktop minimises new windows while tests run:** cause unknown. Is a window tool, focus
-  setting, or the Claude desktop app responsible? This is an open question for you.
-- **Suite b timing sensitivity:** older geometry failures recorded at Gate 2 under desktop load
-  may come from the same interference; this is unconfirmed.
-- **Optional diagnostic:** naming an iconic root in GUI test failure messages was proposed, not
-  approved.
-- **Rejected results:** the candidate pose of a rejected result is not shown; that option is not
-  approved.
-- **Code 04 local search:** cannot be cancelled; a late result is discarded if stale.
-- **Font licence:** the font zip `assets/engineering-plot-regular_freefontdownload_org.zip` is
-  tracked and pushed, with its licence unresolved. There is no root `.gitignore`. Both are your
-  decisions; a fix is proposed in `docs/M1_STAGE3_HANDOFF.md` §1.
-- **Selected-scan highlight:** the green highlight can blend with tab:green scans 3, 13 and 23
-  (a fix is proposed, not approved).
-- **Not implemented:** tracking, Wi-Fi and continuous localisation.
+**Hardware blockers (all open, none solved):**
+- The ESP32 stopped working when USB was unplugged, with the battery connected. It is probably
+  powered by USB only (switch, charge or wiring). Unconfirmed.
+- The front-right wheel spun unexpectedly, while the earlier firmware sent only zero speed.
+  One hypothesis, unverified: a different, directly driven motor board, whose input is switched
+  by the I²C signals on GPIO19/21.
+- The motor-controller board type is not physically confirmed. The classroom has both I²C and
+  direct-PWM robots.
+- I²C to the motor board is not independently verified. `MecanumCar_v2` ignores ACKs, so a
+  wrong board fails silently.
+- The battery switch is not yet shown to remove motor power reliably.
+- The new firmware has not been flashed or tested.
+
+**Software limitations:**
+- Rotations last `time / 2`; the panel compensates with `time=600`.
+- `MecanumCar_v2` sends `Stop()` once, with no repeat.
+- Linux key auto-repeat (press/release pairs) is not handled; Windows is the target.
+- The professor's default SSID and password are shared by every classroom robot.
+  `WorkspaceDrive` uses your own `wifi_secrets.h`.
+
+**Documentation conflict:** `firmware/WorkspaceDrive/README.md` "Test after flashing" step 4
+says to press EN during a move. Friday's plan says not to reset the ESP32 deliberately during
+motion. **Skip that step.** An edit to the README is proposed and awaits your approval.
+
+**Carried over from M1:**
+- The desktop minimises test windows (cause unknown).
+- The font zip licence is unresolved, and there is no root `.gitignore`.
+- The green highlight blends with tab:green scans.
+- Code 04 local search cannot be cancelled.
 
 ## Decisions and rationale
-- **No runner-up marker for `ambiguous` results:** ambiguous is a rejected status, and "only
-  ok/weak draw a pose" takes precedence over the handoff checklist. The alternative pose is given
-  in the result text instead.
-- **Verdict in the chip, not the viewport captions:** the captions keep their map details.
-- **Lazy 05 VectorMap:** it is built on the first 05 Localise and shared with page 05, so Workspace
-  start-up timing is unchanged.
-- **Inline Localisation group, not a pinned footer:** this follows the handoff layout.
-- **GC teardown in the GUI tests:** approved by you on 2026-11-04.
-- **No code change for the minimisation:** the cause is external.
-
-No `docs/decisions/` records exist yet. These decisions live here and in the Gate 3 report.
+- **Restart from 832e7ae on the professor's routes; one HTTP contract for I²C and PWM; only
+  I²C now:** reasons in `docs/decisions/2026-11-04_workspace_drive_restart.md`.
+- **No ARM/DISARM and no motor lock (your request):** safety comes from the firmware's 500 ms
+  timeout, the panel's stop rules and the battery switch.
+- **Keys bound only to the drive pad, plus a keepalive from `tick()`:** typing in entry fields
+  never drives, and a hidden page or a frozen GUI stops the robot.
+- **urllib, not requests:** no new dependency.
+- **Earlier M1 decisions:** see `results/m1_gate3_20261104_092409/REPORT.md`.
 
 ## Uncommitted changes and Git status
-- Branch `feature/ui-redesign` at **536dba2** "M1 Stage 3: one-shot localisation implemented,
-  Gate 3 pending" (2026-11-04). It holds exactly the 8 files listed above, on top of c65a78e.
-- A follow-up docs commit records the hash in `docs/STATUS.md` and this file. Both commits were
-  pushed to `origin/feature/ui-redesign` on 2026-11-04 with your approval. `git log --oneline -3`
-  shows the docs commit's own hash.
-- At handoff, nothing was staged, there were no tracked changes, and there were no stashes.
-- Untracked, **leave untracked** (unrelated or generated):
-  - `results/` (71 MB of evidence; never tracked)
-  - `.idea/` (IDE)
-  - `__pycache__/` (bytecode)
-  - `hang.log`
-  - `LD06.zip` (third-party library)
-  - the three French TP `.md` files (course material)
-  - `scans/classroom_extended.json` (byte-identical to `classroom_final.json`)
-  - `assets/fonts/` (font README, `.gitignore` and the ignored `local/` font, pending the licence
-    decision)
-- A separate worktree `C:/Users/stuar/Desktop/SLAM-autonomy` (branch
-  `feature/autonomy-simulator`, also at c65a78e) exists. It has its own untracked work
-  (`autonomy/`, and Wi-Fi/dashboard notes under `docs/design/` and `docs/research/`), seen only
-  read-only with `git status`. It was not touched in this session. Leave it alone; none of it
-  belongs to this branch.
-
-**Commit history for Stage 3:**
-- 536dba2 was committed on 2026-11-04 with your approval, as a checkpoint. It does **not** mean
-  Gate 3 is accepted.
-- When Gate 3 passes, the updated Gate 3 report evidence stays in `results/` (untracked). Commit
-  `docs/STATUS.md` and this file with your approval.
+Checked on 2026-11-04 with `git status`, `git log` and `git rev-parse`:
+- **Branch `feature/workspace-drive`:** HEAD **ca6826b** "Workspace Drive: ZQSD panel and
+  minimal I2C firmware (hardware untested)", equal to `origin/feature/workspace-drive`.
+- **Other branches, not modified:**
+  - `feature/ui-redesign` = `origin/feature/ui-redesign` = 832e7ae;
+  - `feature/http-robot-mvp` = origin = 74711dc (worktree `C:/Users/stuar/Desktop/SLAM-autonomy`);
+  - `main` = bd8b842.
+- **Uncommitted, from this handoff:** `docs/STATUS.md` and `docs/SESSION_HANDOFF.md`
+  (modified), and `docs/decisions/2026-11-04_workspace_drive_restart.md` (new).
+- **Untracked, leave out of commits:** `results/`, `.idea/`, `__pycache__/`, `hang.log`,
+  `LD06.zip`, the three French TP `.md` files, `scans/classroom_extended.json`, `assets/fonts/`.
+- **Never committed (ignored):** `firmware/WorkspaceDrive/wifi_secrets.h`, `ld06.*`,
+  `MecanumCar_v2.*`. They don't exist in the repo yet; you add them on the flashing PC.
 
 ## Suggested spec status changes (awaiting approval)
-None. `docs/specs/` is empty.
+- `docs/specs/workspace_drive.md`: keep it **Approved**. Change it to Implemented only after
+  Gate B and real ZQSD driving pass on the robot.
 
 ## Next recommended milestone
-Recommendation only, not an agreed plan: finish and accept Gate 3 (above) before anything else.
-After that, M2 (a common input layer for recorded and USB scans), as listed in `docs/STATUS.md`.
+Recommendation, not an agreed plan: **real ZQSD driving of the I²C robot from the Workspace.**
+
+**Acceptance criteria:**
+1. Gate A passes:
+   - the board is confirmed I²C (0x30, GPIO19/21);
+   - the ESP32 stays on with the battery alone;
+   - the battery switch removes motor power every time;
+   - no wheel moves at startup or shutdown.
+2. `firmware/WorkspaceDrive` is flashed; the Serial Monitor shows `AP IP: 192.168.4.1`; `/ping`
+   answers `OK` from the laptop.
+3. In the Workspace, Connect shows "Connected to …". Each of Z, S, Q, D, A and E moves the
+   intended wheels in the intended directions, with the wheels clear of the ground.
+4. The wheels stop within about 0.5 s of: release, Space, clicking off the pad, Disconnect,
+   and the laptop's Wi-Fi turned off.
+5. Results recorded in a new `results/workspace_drive_<timestamp>/` and in `docs/STATUS.md`.
 
 ## How to resume
-1. Read `AGENTS.md`, then this file and `docs/STATUS.md`. Run `git log --oneline -3` and
-   `git status`. Confirm that HEAD is the docs commit on top of 536dba2 (or a later approved
-   commit), and that the working tree matches "Uncommitted changes and Git status" above.
-2. Setup: Windows, `.\.venv\Scripts\python.exe` (Python 3.13). No hardware is needed for Gate 3.
-   Hardware (LD06 → ESP32 → CH340 on COM7, 115200) is needed only for the optional real-capture
-   check, and only with your approval.
-3. **Make the desktop idle first:** no clicking, no window switching, and no other app bringing
-   itself forward during GUI runs. Optional check:
-   `.\.venv\Scripts\python.exe -I results\m1_gate3_20261104_092409\scripts\bare_window_probe.py 1920 1080 30`.
-   It must print only `None -> normal` and `done`. If it prints `-> iconic`, stop: the desktop is
-   still minimising windows.
-4. Back up `results/workspace/` and `results/gui_review/` into a new timestamped
-   `results/m1_gate3_<timestamp>/`, because the GUI tests overwrite them.
-5. Run, one after another, saving each log in that folder:
-   1. `.\.venv\Scripts\python.exe -m unittest test_gui_map_display test_gui_workspace -v`, three
-      times in a row. All three runs must be OK.
-   2. `.\.venv\Scripts\python.exe -m unittest test_gui_workspace_localisation -v`
-   3. `.\.venv\Scripts\python.exe gui_smoke_test.py`
-   4. The hash check against `results/m1_gate0_20261104_041714/hashes_before.json`.
-6. If a GUI run fails, run `scripts/diagnose_mapping.py` from the evidence folder to see whether
-   the root was `iconic` before treating it as a code defect.
-7. Update the Gate 3 report and `docs/STATUS.md`. Ask for the Gate 3 review and acceptance.
-   Do not stage, commit or push without approval. Do not start M2.
+1. Read `AGENTS.md`, then this file and `docs/STATUS.md`. Run `git status` and
+   `git log --oneline -3`. Expect `feature/workspace-drive` at ca6826b, or a later approved
+   docs commit.
+2. **Setup:**
+   - Windows, `.\.venv\Scripts\python.exe` (Python 3.13);
+   - Arduino IDE 2 with esp32 core 3.3.12, Async TCP 3.5.0 and ESP Async WebServer 3.12.1
+     (installed on this PC);
+   - USB is CH340 on **COM7**.
+3. **Friday's first action is Gate A, at the robot, wheels off the ground, hand on the battery
+   switch, no movement commands.** You do these; Claude never flashes, opens a COM port or
+   drives motors.
+   1. **Motor board:** photograph it and ask the professor whether it is the I²C (0x30)
+      controller that `MecanumCar_v2` expects, or a direct-PWM driver. If it is PWM, stop: fill
+      in spec section 5 first.
+   2. **Power:** measure the battery voltage. Battery on, USB unplugged: the ESP32 LED stays on
+      and its Wi-Fi network stays visible.
+   3. **Cut-off:** check that the battery switch removes motor power every time (if a wheel
+      spins, the switch stops it).
+   4. **Startup and shutdown:** power up and power down normally a few times, and watch for any
+      wheel movement. Do not reset the ESP32 deliberately during motion.
+   5. **I²C, if appropriate:** with a non-moving diagnostic, confirm that 0x30 answers on
+      GPIO19/21 only when motor power is on. Options:
+      - the locked diagnostic build already on the robot, if it is still flashed (its `[I2C]
+        … VERDICT` boot lines);
+      - a 15-line address-only scanner sketch, which Claude can write on your approval.
+
+   **If a wheel spins by itself, or motor power cannot be removed reliably, stop testing and
+   take it to the professor.**
+4. **Gate B, only after all of Gate A passes:**
+   1. Open `firmware/WorkspaceDrive/WorkspaceDrive.ino` in Arduino IDE.
+   2. Copy `MecanumCar_v2.cpp/.h` (from `Downloads\MecanumCar_v2.zip`) and `ld06.cpp`, `ld06.h`,
+      `ld06crc.h` (from `Downloads\WIFI ROBOT.zip`, `TP LIDAR\`) next to it. Copy
+      `wifi_secrets.example.h` to `wifi_secrets.h`, with a unique SSID and a password of at
+      least 8 characters.
+   3. Board ESP32 Dev Module, port COM7, Upload (hold BOOT if it stalls on "Connecting…").
+   4. Serial Monitor at 115200: `AP IP: 192.168.4.1`, and no wheel movement.
+   5. Join the robot's Wi-Fi from the laptop; open `http://192.168.4.1/ping`, which should
+      answer `OK`.
+   6. Run `.\.venv\Scripts\python.exe 00_main_app.py`, open the Workspace, find "Drive (robot)",
+      and click Connect.
+   7. Robot supported, wheels clear, cut-off verified: click the drive pad and make brief,
+      supervised presses of Z, S, Q, D, A and E, then Space.
+   8. Record which wheels move, in which direction, and whether they stop. Skip the README's
+      "press EN during a move" step.
+5. Bring the results back to Claude. Next come the acceptance criteria above, then (priority 4)
+   live LiDAR localisation. Do not start autonomy, exploration, path planning, new mapping
+   features or UI redesigns.
 
 ## Confirmed facts vs assumptions
-- **Confirmed** by files, Git and commands seen in this session:
-  - all the test results, timestamps and hashes above
-  - the Git state and the worktree list
-  - `classroom_extended.json` is byte-identical to `classroom_final.json`
-  - `results/` is untracked (0 tracked files)
-  - the root was `iconic` at each instrumented failure
-  - bare windows were minimised
+- **Confirmed** (Git, files and commands run in this session):
+  - the branch tips and the push above;
+  - the files in ca6826b;
+  - the compile and test results in the table;
+  - the professor's files and their contents (pins 19/21, address 0x30, speed 80, routes, the
+    2 s cap, the shared SSID and password);
+  - Async TCP and ESP Async WebServer installed in `Documents\Arduino\libraries`;
+  - esp32 core 3.3.12.
+- **User-reported, not observed here:**
+  - the ESP32 stops without USB;
+  - the front-right wheel spin;
+  - "no movement works";
+  - some classroom robots use different motor hardware (from the professor);
+  - LiDAR and Wi-Fi work on USB power.
 - **Assumed:**
-  - The minimisation comes from the desktop environment or a user-side tool, not from Windows
-    itself for a specific reason: it is unverified, and only the foreground window was recorded.
-  - The Gate 2 geometry failures had the same cause: unverified.
-  - The COM7 capture working is user-reported, not observed in this session.
+  - this robot is the I²C type;
+  - the "Upper" motors are the front ones;
+  - the earlier locked diagnostic build may still be on the robot (unknown);
+  - the wheel-spin cause.
