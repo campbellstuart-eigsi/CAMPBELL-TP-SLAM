@@ -24,6 +24,17 @@ The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP chan
     checkpoints, reset reason, reset-loop count, motor I²C ACK at boot. `MOTORS_LOCKED 1`:
     `/arm` refused.
   - `test_firmware_static.py` (6 checks; fails on 221c778 as intended).
+- **Diagnostic firmware committed and pushed: 275782b** (`origin/feature/http-robot-mvp`).
+- **Headless live localisation (uncommitted, awaiting review):**
+  - `autonomy/live_localisation.py`: `LiveTracker` (Code 04 global search to start or recover;
+    local search seeded with the last accepted pose; lost after 3 local failures; only
+    ok/weak give a pose; stale scans skipped; the map is never modified).
+  - `autonomy/localisation_sim.py`: Part 1 classroom route and report.
+  - `test_autonomy_live_localisation.py`: 9 tests.
+  - Full route, 240 scans: 240 ok (1 global); position error median 4.9 cm, max 5.8 cm (the
+    fixture map's known half-cell bias). On Code 04's control map: max 4.9 mm. Heading max
+    0.58°; median 264 ms per scan.
+  - All errors are against **simulated** truth, not real accuracy.
 - **Hardware facts:** the I²C motor controller type is confirmed (user, from the professor).
   Address 0x30, GPIO19/21 and the register map come from the library code only, **not
   checked on the robot**.
@@ -35,10 +46,10 @@ The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP chan
   continues on `feature/ui-redesign` (`C:\Users\stuar\Desktop\SLAM`).
 
 ## Next steps
-1. Your review of the diagnostic firmware; a commit only with your approval.
-2. Next offline milestone (proposed): a headless live-localisation tracker (Code 04 on
-   simulated scan sequences, measured against simulated truth), then the Live Localisation and
-   Live Exploration workspaces.
+1. Your review of the headless tracker; a commit only with your approval.
+2. Next (proposed): tracking on the real classroom map (`classroom_final.json`) with scans
+   simulated from its vector map; then the Live Localisation workspace (four panels, worker
+   thread, simulator); then Live Exploration.
 3. At the robot: S1a with the diagnostic build (README section 7); S1b only after the cut-off
    and reset checks pass.
 
@@ -75,6 +86,8 @@ The fuller briefing is in `docs/SESSION_HANDOFF.md` (written before the MVP chan
 | `compile_check.py` on the 221c778 build | PASSED (947,180 B flash, 72 %) |
 | `python firmware\ESP32SlamRobot\compile_check.py --ld06-zip … --mecanum-zip … --libraries <scratch>` on the diagnostic build (from the worktree, after restoring `wifi_secrets.example.h`) | PASSED: no secrets → `#error`; example password → `static_assert`; test password → 950,032 B flash (72 %), 93,992 B RAM (28 %). `--warnings all`: only the known `ld06.cpp` warning |
 | `-m unittest test_firmware_static test_autonomy_http test_autonomy_teleop test_autonomy_protocol test_autonomy_link test_autonomy_wifi` (after the diagnostic changes) | 153 OK |
+| AGENTS.md headless suite + all autonomy modules + `test_firmware_static` + `test_autonomy_live_localisation` (after the tracker) | 593 OK (316 s) |
+| `python -m autonomy.localisation_sim` (240-scan route) | 240/240 ok; `results/live_localisation_20261104_152215/` |
 
 ## Untested / unverified
 - **Firmware: COMPILE-VERIFIED / HARDWARE-UNTESTED.** Never run on the robot: watchdog, leases,
