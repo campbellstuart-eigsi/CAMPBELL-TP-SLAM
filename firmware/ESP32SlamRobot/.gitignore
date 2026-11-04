@@ -3,3 +3,5 @@
 ld06.h
 ld06.cpp
 ld06crc.h
+# The robot's real Wi-Fi name and password (copy of wifi_secrets.example.h).
+wifi_secrets.h

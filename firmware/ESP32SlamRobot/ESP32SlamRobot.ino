@@ -1,12 +1,13 @@
 // ============================================================
-// ESP32SlamRobot - DRAFT, NOT YET RUN ON THE ROBOT
-// Built from the course sketch ESP32RobotControl.ino.
+// ESP32SlamRobot - COMPILE-VERIFIED, HARDWARE-UNTESTED (never run on the robot)
+// Built from the course sketch ESP32RobotControl.ino. Build and upload: README.md.
 //
 // Kept:    the Wi-Fi AP and every course route (/forward ... /scan, /pose, /ping).
 // Added:   ARM/STOP, one motor owner task, /drive, /scan2, /status,
 //          motor stop on Wi-Fi client loss, optional LiDAR stop zones,
 //          a task watchdog on the motor task (a hung task reboots the ESP32,
-//          and setup() stops the motors first).
+//          and setup() stops the motors first), Wi-Fi name and password in the
+//          untracked wifi_secrets.h, the command seq kept across /arm.
 //
 // Put ld06.h, ld06.cpp and ld06crc.h in this sketch folder (as in the course
 // sketch) and install the MecanumCar_v2, AsyncTCP and ESPAsyncWebServer libraries.
@@ -23,13 +24,30 @@
 #include "ld06.h"
 #include "MecanumCar_v2.h"
 
+// Declared before the first function: the Arduino builder puts its generated
+// function prototypes (replyMove(..., MoveResult)) above the first function.
+enum MoveResult { MOVE_OK, MOVE_DISARMED, MOVE_NO_LIDAR, MOVE_BLOCKED, MOVE_STALE };
+
 // ------------------------------------------------------------
 // SETTINGS TO CHECK BEFORE FLASHING
 // ------------------------------------------------------------
 // Give every robot its own name and password: all course robots otherwise share
 // "RobotESP32", and anyone joined to the network can send drive commands.
-const char* ROBOT_SSID = "RobotESP32-SLAM";
-const char* ROBOT_PASSWORD = "change-this-password";
+// ROBOT_SSID and ROBOT_PASSWORD live in wifi_secrets.h, which is never committed:
+// copy wifi_secrets.example.h to wifi_secrets.h and edit it (README.md).
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#else
+#error "wifi_secrets.h is missing: copy wifi_secrets.example.h to wifi_secrets.h and set ROBOT_SSID and ROBOT_PASSWORD (README.md)."
+#endif
+
+constexpr bool sameText(const char* a, const char* b) {
+  return *a == *b && (*a == '\0' || sameText(a + 1, b + 1));
+}
+static_assert(!sameText(ROBOT_PASSWORD, "change-this-password"),
+              "wifi_secrets.h still has the example password: choose your own.");
+static_assert(sizeof(ROBOT_PASSWORD) - 1 >= 8 && sizeof(ROBOT_PASSWORD) - 1 <= 63,
+              "ROBOT_PASSWORD must be 8 to 63 characters (WPA2).");
 const int   WIFI_CHANNEL = 6;
 
 const int      MAX_PWM = 80;           // 100 % in /drive. 80 is the library's default speed.
@@ -84,10 +102,6 @@ uint32_t lastCommandSeq = 0;
 uint32_t i2cNacks = 0;
 uint32_t guardTrips = 0;
 uint32_t bootId = 0;
-
-// Declared here, not before requestMove(): the Arduino builder puts its generated
-// function prototypes (replyMove(..., MoveResult)) above the first function.
-enum MoveResult { MOVE_OK, MOVE_DISARMED, MOVE_NO_LIDAR, MOVE_BLOCKED, MOVE_STALE };
 
 uint32_t scanSeq = 0;
 uint32_t scanEndMs = 0;
@@ -529,7 +543,8 @@ void setup() {
     endMoveLocked(millis());
     fault = false;
     armed = true;
-    lastCommandSeq = 0;
+    // lastCommandSeq is NOT reset: a /drive sent before a STOP and delayed in
+    // the network must stay STALE after the next ARM. It restarts only at boot.
     portEXIT_CRITICAL(&stateMux);
     replyText(r, 200, "ARMED");
   });

@@ -4,7 +4,7 @@ The firmware is firmware/ESP32SlamRobot/ESP32SlamRobot.ino: an ESP32 SoftAP
 (default http://192.168.4.1) with HTTP GET routes. The routes used here:
 
     /status   JSON: boot_id, armed, fault, moving, lease_ms, cmd_seq, scan_seq, ...
-    /arm      arms (and clears a fault); the robot's command seq restarts at 0
+    /arm      arms (and clears a fault); the command seq is kept (restarts at boot)
     /stop     stops the motors AND disarms
     /drive    ?vx=&vy=&wz=&time=&seq=  percent of MAX_PWM; a lease of at most
               LEASE_MAX_MS: the robot stops by itself when it runs out
@@ -140,7 +140,12 @@ class HttpRobotLink(RobotLink):
         except OSError as error:
             return CommandResult(False, f"timeout: {error}")
         if code == 200 and body.strip() == b"ARMED":
-            self.seq = 0             # the firmware restarts its command seq on /arm
+            # The firmware keeps its command seq across ARM (so a delayed old
+            # /drive stays STALE) and restarts it only at boot: continue from it.
+            try:
+                self.seq = max(self.seq, self.status()["cmd_seq"])
+            except (OSError, ValueError, LinkError) as error:
+                return CommandResult(False, f"armed, but /status failed: {error}")
             self.stop_event.clear()
             return CommandResult(True)
         return CommandResult(False, f"HTTP {code} {body[:40]!r}")
@@ -260,6 +265,16 @@ class HttpRobotLink(RobotLink):
         while time.monotonic() < end:
             time.sleep(min(POLL_MS / 1000.0, max(0.0, end - time.monotonic())))
         return MoveResult("link_lost", seq=self.seq, detail=detail)
+
+    def latest_scan(self):
+        """The robot's newest scan, without waiting: (seq, end_ms, still,
+        points), or None when it has none yet. Raises OSError / ValueError."""
+        code, body = self._get("/scan2")
+        if code == 503:
+            return None
+        if code != 200:
+            raise ValueError(f"/scan2 answered HTTP {code}")
+        return parse_scan2(body)
 
     def request_scan(self, timeout_ms=2000):
         """The first still scan newer than the last motion (CCW angles)."""

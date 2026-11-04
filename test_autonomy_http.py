@@ -148,12 +148,42 @@ class MoveTests(HttpLinkTestCase):
         self.assertEqual(result.outcome, "fault")
         self.assertIn("still moving", result.detail)
 
-    def test_seq_restarts_after_arm(self):
+    def test_seq_continues_across_arm(self):
         self.connect_and_arm()
         self.assertTrue(self.link.move(0.05, 0.0).completed)
         self.assertTrue(self.link.arm().ok)
         self.assertTrue(self.link.move(0.05, 0.0).completed)
-        self.assertEqual([d[4] for d in self.robot.drives], [1, 1])
+        self.assertEqual([d[4] for d in self.robot.drives], [1, 2])
+
+    def raw_drive(self, seq, time_ms=300):
+        """A /drive arriving late from the network, bypassing the link."""
+        code, body = self.link._get(f"/drive?vx=40&vy=0&wz=0&time={time_ms}&seq={seq}")
+        return code, body.decode()
+
+    def test_delayed_drive_after_stop_is_refused(self):
+        self.connect_and_arm()
+        self.assertEqual(self.link.drive(40, 0, 0, 300)[0], 200)     # seq 1
+        self.assertTrue(self.link.stop().ok)
+        self.assertEqual(self.raw_drive(seq=2), (423, "DISARMED"))  # a newer seq, but disarmed
+        self.assertFalse(self.robot.move_active)
+
+    def test_delayed_drive_after_rearm_is_stale(self):
+        self.connect_and_arm()
+        self.assertEqual(self.link.drive(40, 0, 0, 300)[0], 200)     # seq 1
+        self.assertEqual(self.link.drive(40, 0, 0, 300)[0], 200)     # seq 2
+        self.link.stop()
+        self.assertTrue(self.link.arm().ok)
+        self.assertEqual(self.raw_drive(seq=1), (409, "STALE_SEQ"))  # sent before STOP
+        self.assertEqual(self.raw_drive(seq=2), (409, "STALE_SEQ"))
+        self.assertFalse(self.robot.move_active)
+        self.assertEqual(self.link.drive(40, 0, 0, 100)[0], 200)     # seq 3: new commands work
+
+    def test_delayed_drive_after_zero_drive_is_stale(self):
+        self.connect_and_arm()
+        self.assertEqual(self.link.drive(40, 0, 0, 300)[0], 200)     # seq 1
+        self.assertEqual(self.link.drive(0, 0, 0, 0)[0], 200)        # seq 2: stop, still armed
+        self.assertEqual(self.raw_drive(seq=1), (409, "STALE_SEQ"))
+        self.assertFalse(self.robot.move_active)
 
 
 class ScanTests(HttpLinkTestCase):

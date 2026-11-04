@@ -2,7 +2,8 @@
 
 It reproduces the rules of firmware/ESP32SlamRobot/ESP32SlamRobot.ino that
 HttpRobotLink depends on, in real time:
-  - boots DISARMED; /arm arms, clears the fault and restarts the command seq;
+  - boots DISARMED; /arm arms and clears the fault (the command seq is kept;
+    it restarts only at boot);
   - /stop stops AND disarms;
   - /drive is refused (in this order) STALE_SEQ, DISARMED, NO_LIDAR; else it
     starts a lease of at most MAX_MOVE_MS that ends by itself;
@@ -19,6 +20,7 @@ without a reply), and `drives`, the /drive requests received.
     robot.close()
 """
 import json
+import math
 import random
 import struct
 import threading
@@ -38,10 +40,57 @@ def sample_points(count=SCAN_POINTS):
     return tuple((i * 36000 // count, 1000 + i, 200) for i in range(count))
 
 
+# Simulator room (metres): a 4 x 3 m box with a 0.5 m crate, robot at the origin.
+ROOM_WALLS = (((-2.0, -1.5), (2.0, -1.5)), ((2.0, -1.5), (2.0, 1.5)), ((2.0, 1.5), (-2.0, 1.5)),
+              ((-2.0, 1.5), (-2.0, -1.5)), ((0.8, 0.3), (1.3, 0.3)), ((1.3, 0.3), (1.3, 0.8)),
+              ((1.3, 0.8), (0.8, 0.8)), ((0.8, 0.8), (0.8, 0.3)))
+# Open-loop plant: speed at 100 % of MAX_PWM. Placeholders, not robot values.
+SIM_FULL_SPEED_M_S = 0.30
+SIM_FULL_TURN_RAD_S = math.radians(120.0)
+SIM_MAX_RANGE_M = 12.0
+
+
+def _distance_to_segment(x, y, wall):
+    (x1, y1), (x2, y2) = wall
+    ex, ey = x2 - x1, y2 - y1
+    t = max(0.0, min(1.0, ((x - x1) * ex + (y - y1) * ey) / (ex * ex + ey * ey)))
+    return math.hypot(x - (x1 + t * ex), y - (y1 + t * ey))
+
+
+def ray_scan(pose, walls=ROOM_WALLS, count=SCAN_POINTS):
+    """CCW scan points of `walls` seen from pose (x, y, theta_rad)."""
+    x, y, theta = pose
+    points = []
+    for i in range(count):
+        angle_cdeg = i * 36000 // count
+        a = theta + math.radians(angle_cdeg / 100.0)
+        dx, dy = math.cos(a), math.sin(a)
+        best = SIM_MAX_RANGE_M
+        for (x1, y1), (x2, y2) in walls:
+            ex, ey = x2 - x1, y2 - y1
+            den = dx * ey - dy * ex
+            if abs(den) < 1e-12:
+                continue
+            t = ((x1 - x) * ey - (y1 - y) * ex) / den      # along the ray
+            u = ((x1 - x) * dy - (y1 - y) * dx) / den      # along the wall
+            if 0.0 < t < best and 0.0 <= u <= 1.0:
+                best = t
+        distance = 0 if best >= SIM_MAX_RANGE_M else int(round(best * 1000.0))
+        points.append((angle_cdeg, distance, 200 if distance else 0))
+    return tuple(points)
+
+
 class FakeHttpRobot:
-    def __init__(self, points=None):
+    """room=True: the robot moves in ROOM_WALLS and scans it (simulator mode);
+    otherwise every scan is `points` (default sample_points(); tests)."""
+
+    def __init__(self, points=None, room=False):
         self.lock = threading.Lock()
+        self.room = room
+        self.pose = (0.0, 0.0, 0.0)  # x m, y m, theta rad (room mode only)
         self.points = sample_points() if points is None else tuple(points)
+        if room:
+            self.points = ray_scan(self.pose)
         self.lidar_ok = True
         self.stuck = False
         self.silent = False
@@ -117,10 +166,26 @@ class FakeHttpRobot:
         if not self.armed or self.fault:
             self._end_move(now)
 
+    def _integrate(self, dt_s):
+        """Room mode: move the pose by the wheel command; never into a wall."""
+        vx, vy, wz = (value / 100.0 for value in self.wheel)
+        x, y, theta = self.pose
+        forward, left = vx * SIM_FULL_SPEED_M_S * dt_s, vy * SIM_FULL_SPEED_M_S * dt_s
+        nx = x + forward * math.cos(theta) - left * math.sin(theta)
+        ny = y + forward * math.sin(theta) + left * math.cos(theta)
+        theta = (theta + wz * SIM_FULL_TURN_RAD_S * dt_s + math.pi) % (2 * math.pi) - math.pi
+        if min(_distance_to_segment(nx, ny, wall) for wall in ROOM_WALLS) < 0.15:
+            nx, ny = x, y           # the simulated bumper: no translation into a wall
+        self.pose = (nx, ny, theta)
+
     def _lidar_loop(self):
         while not self._closing.wait(SCAN_PERIOD_MS / 1000.0):
             with self.lock:
                 now = self._now()
+                if self.room:
+                    if self.move_active:
+                        self._integrate(SCAN_PERIOD_MS / 1000.0)
+                    self.points = ray_scan(self.pose)
                 if self.lidar_ok:
                     started = now - len(self.points) * 2 // 9
                     self.scan_seq += 1
@@ -190,8 +255,7 @@ class FakeHttpRobot:
             elif url.path == "/arm":
                 self._end_move(now)
                 self.fault = False
-                self.armed = True
-                self.last_seq = 0
+                self.armed = True       # last_seq is kept: it restarts only at boot
                 body = "ARMED"
             elif url.path == "/stop":
                 if not self.stuck:
